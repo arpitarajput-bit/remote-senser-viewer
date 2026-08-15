@@ -1,0 +1,10 @@
+# Uploaded / stored rasters
+backend/uploads/
+backend/storage/
+backend/chunks/
+
+# Node modules & build
+frontend/node_modules/
+frontend/dist/
+backend/__pycache__/
+*.pyc
