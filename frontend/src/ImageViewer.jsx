@@ -170,7 +170,7 @@ export default function ImageViewer() {
   const abortControllerRef = useRef(null);
   const activeObjectUrlRef = useRef(null);
   const thumbnailCacheRef = useRef({});
-
+  const rgbBeforeHistRef = useRef(null);
   const viewStateRef = useRef({});
   const currentViewKeyRef = useRef(null);
   const viewBeforeSwipeRef = useRef(null);
@@ -178,10 +178,13 @@ export default function ImageViewer() {
   const imageHistoryRef = useRef({});
   const historyContextRef = useRef(null);
 
-  // Per-container history refs
+  // Per-container history refs (authoritative for zoom/pan)
   const containerRgbRef = useRef({});
   const containerStretchRef = useRef({});
   const containerViewStateRef = useRef({});
+
+  // Track if user has manually set view (zoom/pan)
+  const userHasSetViewRef = useRef(false);
 
   const getHistoryKey = (containerName, filename) => {
     if (!containerName || !filename) return null;
@@ -295,6 +298,7 @@ export default function ImageViewer() {
     return thumbnailCacheRef.current[filePath];
   }, []);
 
+  // loadImage: only auto-fits on the very first image, never after user has set view
   const loadImage = (url, viewKey = null, preserveView = false) => {
     if (abortControllerRef.current) abortControllerRef.current.abort();
     if (activeObjectUrlRef.current) {
@@ -311,14 +315,14 @@ export default function ImageViewer() {
       setIsImageLoading(false);
       currentViewKeyRef.current = viewKey;
 
-      const cachedView = viewKey ? viewStateRef.current[viewKey] : null;
-      if (cachedView) {
-        setScale(cachedView.scale);
-        setPosition(cachedView.position);
-      } else if (preserveView) {
-        setScale((s) => s);
-        setPosition((p) => p);
-      } else if (containerRef.current) {
+      const shouldAutoFit =
+        !userHasSetViewRef.current &&
+        scale === 1 &&
+        position.x === 0 &&
+        position.y === 0 &&
+        containerRef.current;
+
+      if (shouldAutoFit && containerRef.current) {
         const cw = containerRef.current.clientWidth;
         const ch = containerRef.current.clientHeight;
         const iw = e.target.naturalWidth;
@@ -326,23 +330,26 @@ export default function ImageViewer() {
         if (iw > 0 && ih > 0) {
           const ratio = Math.min(cw / iw, ch / ih) * 0.95;
           setScale(Math.max(MIN_SCALE, Math.min(ratio, 1)));
-        } else {
-          setScale(1);
+          setPosition({ x: 0, y: 0 });
         }
-        setPosition({ x: 0, y: 0 });
-      } else {
-        setScale(1);
-        setPosition({ x: 0, y: 0 });
       }
+      // In all other cases, do NOT change scale/position here.
     };
     preloader.src = url;
   };
 
+  // Save per-container view on every scale/position change
   useEffect(() => {
-    const key = currentViewKeyRef.current;
-    if (!key) return;
-    viewStateRef.current[key] = { scale, position };
-  }, [scale, position]);
+    if (!activeContainer) return;
+    containerViewStateRef.current[activeContainer] = {
+      scale,
+      position: { ...position },
+      rFile,
+      gFile,
+      bFile,
+      stretch: cloneStretchValues(stretchValues),
+    };
+  }, [scale, position, rFile, gFile, bFile, stretchValues, activeContainer]);
 
   useEffect(() => {
     saveCurrentImageHistory();
@@ -413,7 +420,6 @@ export default function ImageViewer() {
     const nextStretch = { ...stretchValues, [channel]: { min: minVal, max: maxVal } };
     setStretchValues(nextStretch);
 
-    // Save to current container's stretch history
     if (activeContainer) {
       containerStretchRef.current[activeContainer] = cloneStretchValues(nextStretch);
     }
@@ -473,9 +479,45 @@ export default function ImageViewer() {
   };
 
   const resetStretch = (channel) => {
-    applyStretchWithValues(channel, "", "");
+    // Always clear stretch for all channels
+    const noStretch = createEmptyStretchValues();
+    setStretchValues(noStretch);
+
+    // Save this as the container's current stretch
+    if (activeContainer) {
+      containerStretchRef.current[activeContainer] = noStretch;
+    }
+
+    // Hide histogram and clear histogram state
     setShowHistogram(false);
     setHistActiveChannel(null);
+    setHistSelectedRange(null);
+    setHistSelectedChannel(null);
+    rgbBeforeHistRef.current = null;
+
+    // If we have RGB files, reload the RGB composite with no stretch
+    if (rFile && gFile && bFile) {
+      setViewMode("rgb");
+      setSelectedFile(null);
+      loadImage(
+        buildCompositeUrl(rFile, gFile, bFile, noStretch),
+        compositeViewKey(rFile, gFile, bFile),
+        false
+      );
+      return;
+    }
+
+    // Fallback: if no RGB, just reload current file with no stretch
+    const fileToRestore = histDropdownFile || selectedFile || rFile || gFile || bFile;
+    if (fileToRestore) {
+      setSelectedFile(fileToRestore);
+      setViewMode("raster");
+      loadImage(
+        buildSingleImageUrl(fileToRestore, noStretch.default),
+        rasterViewKey(fileToRestore),
+        true
+      );
+    }
   };
 
   const applyRGBFromFiles = useCallback(
@@ -495,7 +537,6 @@ export default function ImageViewer() {
       setGFile(g);
       setBFile(b);
 
-      // Save as this container's RGB state
       if (r && g && b) {
         containerRgbRef.current[containerName] = { r, g, b };
       }
@@ -511,13 +552,89 @@ export default function ImageViewer() {
     [stretchValues]
   );
 
-  const autoSelectRGBForContainer = useCallback(
-    (containerName) => {
-      const files = containers[containerName] || [];
-      applyRGBFromFiles(containerName, files);
-    },
-    [containers, applyRGBFromFiles]
-  );
+  // ---------------------------------------------------------------------
+  // FIX: these three were called throughout the file (container switch,
+  // RGB-channel change, delete flows) but were never actually defined,
+  // so every one of those code paths threw a ReferenceError and silently
+  // aborted — which is why deleting a band never fell back to a fresh RGB
+  // composite of whatever files were left in the container.
+  // ---------------------------------------------------------------------
+
+  // Auto-pick R/G/B from whatever files exist in a container (used when
+  // switching to a container that has no remembered RGB selection yet).
+  const autoSelectRGBForContainer = (containerName) => {
+    const files = containers[containerName] || [];
+    applyRGBFromFiles(containerName, files);
+  };
+
+  // Restore the zoom/pan this container had the last time it was active.
+  const restoreContainerView = (containerName) => {
+    if (!containerName) return;
+    const saved = containerViewStateRef.current[containerName];
+    if (saved) {
+      setScale(saved.scale);
+      setPosition(saved.position);
+    }
+  };
+
+  // Called after deleting a raster that was either the selected single-band
+  // view or one of the R/G/B channels. Picks fresh R/G/B from whatever
+  // files remain in the container (r = 1st remaining file, g = 2nd or
+  // falls back to the 1st, b = 3rd or falls back to g — same convention
+  // applyRGBFromFiles already uses on upload), clears any stretch so the
+  // fallback composite renders plainly, and loads it into the viewport.
+  // If the container is now completely empty, the viewport is cleared.
+  const recomputeRGBAfterDelete = (containerName, deletedFilename) => {
+    const remainingFiles = (containers[containerName] || []).filter(
+      (f) => f !== deletedFilename
+    );
+
+    if (remainingFiles.length === 0) {
+      setRFile("");
+      setGFile("");
+      setBFile("");
+      setSelectedFile(null);
+      setViewMode("");
+      setDisplayedImageUrl("");
+      setRasterInfo(null);
+      delete containerRgbRef.current[containerName];
+      delete containerStretchRef.current[containerName];
+      return;
+    }
+
+    const r = remainingFiles[0];
+    const g = remainingFiles[1] || remainingFiles[0];
+    const b = remainingFiles[2] || g;
+
+    setRFile(r);
+    setGFile(g);
+    setBFile(b);
+    setSelectedFile(null);
+    setViewMode("rgb");
+
+    containerRgbRef.current[containerName] = { r, g, b };
+
+    const noStretch = createEmptyStretchValues();
+    setStretchValues(noStretch);
+    containerStretchRef.current[containerName] = noStretch;
+
+    loadImage(
+      buildCompositeUrl(r, g, b, noStretch),
+      compositeViewKey(r, g, b),
+      false
+    );
+
+    // Keep the metadata strip (width/height/bands) in sync with the new
+    // reference file now driving the composite.
+    axios
+      .get(`${API}/metadata`, { params: { filename: r } })
+      .then((res) => setRasterInfo(res.data))
+      .catch((err) => console.error("Failed to load raster info:", err));
+
+    setTimeout(() => {
+      restoreContainerView(containerName);
+    }, 0);
+  };
 
   const handleFileSelectInput = (e) => {
     const uploadedFiles = e.target.files;
@@ -563,7 +680,7 @@ export default function ImageViewer() {
         });
 
         const storedFilePath = `${targetContainerName}/${file.name}`;
-        
+
         setContainers((prev) => {
           const existingFiles = prev[targetContainerName] || [];
           if (existingFiles.includes(storedFilePath)) return prev;
@@ -620,6 +737,10 @@ export default function ImageViewer() {
         }
       });
 
+      delete containerRgbRef.current[containerName];
+      delete containerStretchRef.current[containerName];
+      delete containerViewStateRef.current[containerName];
+
       if (activeContainer === containerName) {
         setActiveContainer(null);
         setActiveRgbContainer("");
@@ -634,6 +755,59 @@ export default function ImageViewer() {
   };
 
   const resetView = () => {
+    // If we have a pre-histogram RGB state, restore that RGB (no stretch) in one click.
+    if (rgbBeforeHistRef.current) {
+      const prev = rgbBeforeHistRef.current;
+      if (prev.r && prev.g && prev.b) {
+        setRFile(prev.r);
+        setGFile(prev.g);
+        setBFile(prev.b);
+
+        // Clear stretch for all channels
+        const noStretch = createEmptyStretchValues();
+        setStretchValues(noStretch);
+
+        // Save this as the container's current stretch
+        if (activeContainer) {
+          containerStretchRef.current[activeContainer] = noStretch;
+        }
+
+        setViewMode("rgb");
+        setSelectedFile(null);
+
+        loadImage(
+          buildCompositeUrl(prev.r, prev.g, prev.b, noStretch),
+          compositeViewKey(prev.r, prev.g, prev.b),
+          false
+        );
+
+        // Clear the ref so next Reset behaves normally
+        rgbBeforeHistRef.current = null;
+
+        // Also reset zoom/pan if you want; if not, remove these lines
+        setScale(1);
+        if (imgRef.current && containerRef.current) {
+          const cw = containerRef.current.clientWidth;
+          const ch = containerRef.current.clientHeight;
+          const iw = imgRef.current.naturalWidth || 0;
+          const ih = imgRef.current.naturalHeight || 0;
+          if (iw > 0 && ih > 0) {
+            setPosition({ x: (cw - iw) / 2, y: (ch - ih) / 2 });
+          } else {
+            setPosition({ x: 0, y: 0 });
+          }
+        } else {
+          setPosition({ x: 0, y: 0 });
+        }
+        userHasSetViewRef.current = true;
+
+        return;
+      }
+      // If prev RGB is not valid, just clear the ref and fall through.
+      rgbBeforeHistRef.current = null;
+    }
+
+    // Normal reset: only reset zoom/pan, do NOT clear the image.
     setScale(1);
     if (imgRef.current && containerRef.current) {
       const cw = containerRef.current.clientWidth;
@@ -648,6 +822,7 @@ export default function ImageViewer() {
     } else {
       setPosition({ x: 0, y: 0 });
     }
+    userHasSetViewRef.current = true;
   };
 
   const handleSelectRaster = async (filename) => {
@@ -698,6 +873,11 @@ export default function ImageViewer() {
       } else {
         setHistDefaultData(null);
       }
+
+      // Restore per-container view after loading image
+      setTimeout(() => {
+        restoreContainerView(containerName);
+      }, 0);
     } else {
       setSelectedFile(filename);
       setViewMode("raster");
@@ -715,6 +895,11 @@ export default function ImageViewer() {
       setHistG(null);
       setHistB(null);
       loadImage(buildSingleImageUrl(filename, restoredStretch.default), rasterViewKey(filename));
+
+      // For first-time open, also restore container view if exists
+      setTimeout(() => {
+        if (containerName) restoreContainerView(containerName);
+      }, 0);
     }
 
     if (containerName) {
@@ -734,6 +919,11 @@ export default function ImageViewer() {
     e.stopPropagation();
     const displayName = getDisplayName(filename);
     if (!window.confirm(`Delete ${displayName}?`)) return;
+
+    const containerName = getContainerForFile(filename) || activeContainer;
+    const wasInRGB = rFile === filename || gFile === filename || bFile === filename;
+    const wasSelected = selectedFile === filename;
+
     try {
       await axios.delete(`${API}/files/${encodeURIComponent(filename)}`);
       setContainers((prev) => {
@@ -754,14 +944,17 @@ export default function ImageViewer() {
       for (const key of Object.keys(imageHistoryRef.current)) {
         if (key.endsWith(`:${filename}`)) delete imageHistoryRef.current[key];
       }
-      if (selectedFile === filename) {
-        setSelectedFile(null);
-        setDisplayedImageUrl("");
-        setRasterInfo(null);
-        setViewMode("");
-      }
+
       if (swipeLeftFile === filename) setSwipeLeftFile("");
       if (swipeRightFile === filename) setSwipeRightFile("");
+
+      // If the deleted file was the single-band selected view, OR it was
+      // one of the active R/G/B channels, fall back to a fresh RGB
+      // composite built from whatever files remain in the container.
+      if (wasSelected || (containerName && activeContainer === containerName && wasInRGB)) {
+        recomputeRGBAfterDelete(containerName, filename);
+      }
+
       showToast(`${displayName} deleted`, "success");
     } catch (err) {
       console.error("Delete failed:", err);
@@ -821,24 +1014,11 @@ export default function ImageViewer() {
     if (isSwipeMode) return;
     saveCurrentImageHistory();
 
-    // Save current view state before changing
-    if (activeContainer) {
-      containerViewStateRef.current[activeContainer] = {
-        scale,
-        position: { ...position },
-        rFile,
-        gFile,
-        bFile,
-        stretch: cloneStretchValues(stretchValues),
-      };
-    }
-
     let nextR = rFile, nextG = gFile, nextB = bFile;
     if (channel === "r") { nextR = value; setRFile(value); }
     if (channel === "g") { nextG = value; setGFile(value); }
     if (channel === "b") { nextB = value; setBFile(value); }
 
-    // Save RGB for current container
     if (activeContainer) {
       containerRgbRef.current[activeContainer] = { r: nextR, g: nextG, b: nextB };
     }
@@ -847,17 +1027,20 @@ export default function ImageViewer() {
     if (isRgbComposite) {
       setSelectedFile(null);
       setViewMode("rgb");
-      
-      // Clear stretch when manually changing RGB - show plain RGB
+
       const noStretch = createEmptyStretchValues();
       setStretchValues(noStretch);
-      
-      // Also clear container's saved stretch
+
       if (activeContainer) {
         containerStretchRef.current[activeContainer] = noStretch;
       }
-      
+
       loadImage(buildCompositeUrl(nextR, nextG, nextB, noStretch), compositeViewKey(nextR, nextG, nextB), true);
+
+      // Restore per-container view after RGB change
+      setTimeout(() => {
+        if (activeContainer) restoreContainerView(activeContainer);
+      }, 0);
     }
   };
 
@@ -999,6 +1182,18 @@ export default function ImageViewer() {
 
     saveCurrentImageHistory();
 
+    // Save current RGB state before histogram stretch (only if we are in RGB mode with valid files)
+    if (viewMode === "rgb" && rFile && gFile && bFile) {
+      rgbBeforeHistRef.current = {
+        r: rFile,
+        g: gFile,
+        b: bFile,
+        stretch: cloneStretchValues(stretchValues),
+      };
+    } else {
+      rgbBeforeHistRef.current = null;
+    }
+
     const defaultFile =
       (selectedFile && activeFilesPool.includes(selectedFile)) ? selectedFile : activeFilesPool[0];
     if (!defaultFile) return;
@@ -1008,28 +1203,7 @@ export default function ImageViewer() {
     setHistDefaultData(null);
     fetchHistogramFor(histDropdownFile || defaultFile, setHistDefaultLoading, setHistDefaultData);
 
-    // Re-apply this container's saved stretch
-    const containerStretch = containerStretchRef.current[activeContainer] || createEmptyStretchValues();
-    setStretchValues(containerStretch);
-
-    if (rFile && gFile && bFile) {
-      setSelectedFile(null);
-      setViewMode("rgb");
-      loadImage(
-        buildCompositeUrl(rFile, gFile, bFile, containerStretch),
-        compositeViewKey(rFile, gFile, bFile),
-        false
-      );
-    } else if (defaultFile) {
-      setSelectedFile(defaultFile);
-      setViewMode("raster");
-      loadImage(
-        buildSingleImageUrl(defaultFile, containerStretch.default || { min: "", max: "" }),
-        rasterViewKey(defaultFile),
-        true
-      );
-    }
-
+    // Do NOT change stretchValues or call loadImage here.
     setShowHistogram(true);
     setShowScatterPlot(false);
     setShowProfileModal(false);
@@ -1039,38 +1213,11 @@ export default function ImageViewer() {
   const closeHistogramAndRestore = () => {
     saveCurrentImageHistory();
 
+    // Only hide the histogram panel; do NOT change stretch or reload the image.
     setShowHistogram(false);
     setHistActiveChannel(null);
     setHistSelectedRange(null);
     setHistSelectedChannel(null);
-
-    // On X: show plain RGB (no stretch), but keep stretchValues for histogram panel
-    const noStretch = createEmptyStretchValues();
-
-    // Clear current view stretch
-    setStretchValues(noStretch);
-
-    if (rFile && gFile && bFile) {
-      setSelectedFile(null);
-      setViewMode("rgb");
-      loadImage(
-        buildCompositeUrl(rFile, gFile, bFile, noStretch),
-        compositeViewKey(rFile, gFile, bFile),
-        false
-      );
-      return;
-    }
-
-    const fileToRestore = histDropdownFile || selectedFile || rFile || gFile || bFile;
-    if (fileToRestore) {
-      setSelectedFile(fileToRestore);
-      setViewMode("raster");
-      loadImage(
-        buildSingleImageUrl(fileToRestore, noStretch.default),
-        rasterViewKey(fileToRestore),
-        true
-      );
-    }
   };
 
   const openScatterPlotModal = () => {
@@ -1152,12 +1299,19 @@ export default function ImageViewer() {
     }
   };
 
-  const handleZoomIn = () => setScale((p) => Math.min(p * 1.25, MAX_SCALE));
-  const handleZoomOut = () => setScale((p) => Math.max(p / 1.25, MIN_SCALE));
+  const handleZoomIn = () => {
+    setScale((p) => Math.min(p * 1.25, MAX_SCALE));
+    userHasSetViewRef.current = true;
+  };
+  const handleZoomOut = () => {
+    setScale((p) => Math.max(p / 1.25, MIN_SCALE));
+    userHasSetViewRef.current = true;
+  };
   const handleWheel = (e) => {
     e.preventDefault();
     const z = e.deltaY < 0 ? 1.15 : 0.85;
     setScale((p) => Math.min(Math.max(p * z, MIN_SCALE), MAX_SCALE));
+    userHasSetViewRef.current = true;
   };
   const handleMouseDown = (e) => {
     if (e.button !== 0) return;
@@ -1185,12 +1339,15 @@ export default function ImageViewer() {
     }
     setIsDragging(true);
     setDragStart({ x: e.clientX - position.x, y: e.clientY - position.y });
+    userHasSetViewRef.current = true;
   };
   const handleMouseMove = (e) => {
     if (!isDragging) return;
     setPosition({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
   };
-  const handleMouseUp = () => setIsDragging(false);
+  const handleMouseUp = () => {
+    setIsDragging(false);
+  };
 
   const getImageStyle = useMemo(
     () => ({
@@ -1289,7 +1446,6 @@ export default function ImageViewer() {
             </div>
           )}
 
-          {/* Stretched histogram below Reset */}
           {(stretch.min !== "" || stretch.max !== "") && (
             <div
               style={{
@@ -1428,7 +1584,6 @@ export default function ImageViewer() {
                     background: isContainerActive ? "#0f172a" : "transparent",
                   }}
                 >
-                  {/* Clickable header bar */}
                   <div
                     style={{
                       ...styles.containerHeaderBar,
@@ -1438,18 +1593,6 @@ export default function ImageViewer() {
                     onClick={() => {
                       saveCurrentImageHistory();
 
-                      // Save current container's view state before switching
-                      if (activeContainer) {
-                        containerViewStateRef.current[activeContainer] = {
-                          scale,
-                          position: { ...position },
-                          rFile,
-                          gFile,
-                          bFile,
-                          stretch: cloneStretchValues(stretchValues),
-                        };
-                      }
-
                       setActiveContainer(containerName);
                       setActiveRgbContainer(containerName);
 
@@ -1457,40 +1600,38 @@ export default function ImageViewer() {
                       const savedStretch = containerStretchRef.current[containerName];
                       const savedViewState = containerViewStateRef.current[containerName];
 
-                      // Restore view state if exists
                       if (savedViewState) {
                         setScale(savedViewState.scale);
                         setPosition(savedViewState.position);
                       }
 
-                      // Reset stretch to this container's saved stretch (or default if none)
                       const stretchToUse = savedStretch || createEmptyStretchValues();
                       setStretchValues(stretchToUse);
 
                       if (savedRgb && savedRgb.r && savedRgb.g && savedRgb.b) {
-                        // Restore last RGB selection
                         setRFile(savedRgb.r);
                         setGFile(savedRgb.g);
                         setBFile(savedRgb.b);
-
                         setViewMode("rgb");
                         setSelectedFile(null);
 
-                        // Show plain RGB (no stretch applied yet)
-                        const noStretch = createEmptyStretchValues();
+                        // Use the saved stretch for this container
                         loadImage(
-                          buildCompositeUrl(savedRgb.r, savedRgb.g, savedRgb.b, noStretch),
+                          buildCompositeUrl(savedRgb.r, savedRgb.g, savedRgb.b, stretchToUse),
                           compositeViewKey(savedRgb.r, savedRgb.g, savedRgb.b),
                           false
                         );
                       } else {
-                        // No saved RGB → auto-select from files
                         autoSelectRGBForContainer(containerName);
                       }
 
                       setHistActiveChannel(null);
                       setHistDropdownFile("");
                       setShowHistogram(false);
+
+                      setTimeout(() => {
+                        restoreContainerView(containerName);
+                      }, 0);
                     }}
                   >
                     <span style={{ flex: 1 }}>
@@ -1499,7 +1640,6 @@ export default function ImageViewer() {
                     <span style={styles.badge}>{files.length}</span>
                   </div>
 
-                  {/* File cards */}
                   {files.map((filePath) => {
                     const fileName = getDisplayFilename(filePath);
                     const isSelected = selectedFile === filePath;
@@ -1537,7 +1677,6 @@ export default function ImageViewer() {
                     );
                   })}
 
-                  {/* Delete container button */}
                   <button
                     style={{
                       alignSelf: "flex-end",
@@ -1800,13 +1939,31 @@ export default function ImageViewer() {
               </div>
             ))}
           </div>
-          {histSelectedRange && (
-            <div style={{ fontSize: "11px", color: "#a5b4fc", marginBottom: "14px", padding: "10px", background: "rgba(59,130,246,0.08)", borderRadius: "6px", border: "1px solid rgba(59,130,246,0.18)" }}>
-              Selected range: <strong>{histSelectedRange.channel === "default" ? "Selected Image" : histSelectedRange.channel.toUpperCase()}</strong> on <strong>{getDisplayName(histSelectedRange.filename)}</strong>
-              <br />
-              Values: {histSelectedRange.min.toFixed(2)} – {histSelectedRange.max.toFixed(2)}
-            </div>
-          )}
+          {histSelectedRange &&
+            typeof histSelectedRange.min === "number" &&
+            typeof histSelectedRange.max === "number" && (
+              <div
+                style={{
+                  fontSize: "11px",
+                  color: "#a5b4fc",
+                  marginBottom: "14px",
+                  padding: "10px",
+                  background: "rgba(59,130,246,0.08)",
+                  borderRadius: "6px",
+                  border: "1px solid rgba(59,130,246,0.18)",
+                }}
+              >
+                Selected range:{" "}
+                <strong>
+                  {histSelectedRange.channel === "default"
+                    ? "Selected Image"
+                    : histSelectedRange.channel.toUpperCase()}
+                </strong>{" "}
+                on <strong>{getDisplayName(histSelectedRange.filename)}</strong>
+                <br />
+                Values: {histSelectedRange.min.toFixed(2)} – {histSelectedRange.max.toFixed(2)}
+              </div>
+            )}
           {histActiveChannel === null && renderHistogramBlock("default", "#38bdf8", "Selected Image", histDropdownFile, histDefaultData, histDefaultLoading)}
           {histActiveChannel === "r" && renderHistogramBlock("r", "#ef4444", "Red Channel", rFile, histR, histRLoading)}
           {histActiveChannel === "g" && renderHistogramBlock("g", "#22c55e", "Green Channel", gFile, histG, histGLoading)}
