@@ -9,7 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 import math
-
+import subprocess
 
 PREVIEW_MAX_SIZE = 1000
 THUMBNAIL_MAX_SIZE = 200
@@ -17,9 +17,10 @@ JPEG_QUALITY = 82
 
 app = FastAPI()
 
+# Fixed CORS for Codespaces
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"https://.*-5173\.app\.github\.dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,11 +32,9 @@ STORAGE_DIR.mkdir(exist_ok=True)
 upload_chunks = {}
 preview_cache = {}
 
-
 def clear_preview_cache():
     """Clear previews after a file is uploaded or deleted."""
     preview_cache.clear()
-
 
 def get_file_path(filename: str) -> Path:
     """Return a safe, resolved file path inside storage."""
@@ -47,7 +46,6 @@ def get_file_path(filename: str) -> Path:
 
     return file_path
 
-
 def validate_file_exists(filename: str) -> Path:
     file_path = get_file_path(filename)
 
@@ -56,12 +54,10 @@ def validate_file_exists(filename: str) -> Path:
 
     return file_path
 
-
 def preview_dimensions(width: int, height: int, max_size: int):
     """Downsample while preserving aspect ratio."""
     scale = min(1.0, max_size / width, max_size / height)
     return max(1, int(width * scale)), max(1, int(height * scale))
-
 
 def read_preview_band(src, band=1, max_size=PREVIEW_MAX_SIZE):
     """Read a downsampled raster band for viewport display."""
@@ -73,7 +69,6 @@ def read_preview_band(src, band=1, max_size=PREVIEW_MAX_SIZE):
         resampling=Resampling.bilinear,
         masked=True,
     )
-
 
 def brighten_preview(data, nodata=None, low_percentile=2, high_percentile=98):
     """
@@ -116,7 +111,6 @@ def brighten_preview(data, nodata=None, low_percentile=2, high_percentile=98):
 
     return np.clip(output, 0, 255).astype(np.uint8)
 
-
 def manual_or_auto_stretch(data, nodata=None, min_val=None, max_val=None):
     """Use manual stretch values when valid; otherwise use automatic brightening."""
     if min_val is None or max_val is None or max_val <= min_val:
@@ -139,7 +133,6 @@ def manual_or_auto_stretch(data, nodata=None, min_val=None, max_val=None):
 
     return np.clip(output, 0, 255).astype(np.uint8)
 
-
 def cached_jpeg_response(cache_key, image, cache_seconds=3600):
     """Return a cached compressed JPEG response."""
     if cache_key not in preview_cache:
@@ -152,7 +145,6 @@ def cached_jpeg_response(cache_key, image, cache_seconds=3600):
         media_type="image/jpeg",
         headers={"Cache-Control": f"public, max-age={cache_seconds}"},
     )
-
 
 @app.get("/api/files")
 def list_files():
@@ -173,7 +165,6 @@ def list_files():
 
     return JSONResponse(content={"containers": containers})
 
-
 @app.post("/api/upload-chunk")
 async def upload_chunk(
     file: UploadFile = File(...),
@@ -193,7 +184,6 @@ async def upload_chunk(
 
     return {"status": "ok", "chunk_index": chunk_index}
 
-
 @app.post("/api/upload-complete")
 def upload_complete(
     upload_id: str = Form(...),
@@ -201,7 +191,7 @@ def upload_complete(
     total_chunks: int = Form(...),
     container_name: str = Form(...),
 ):
-    """Combine chunks into one GeoTIFF file."""
+    """Combine chunks into one GeoTIFF file and convert to COG."""
     if upload_id not in upload_chunks:
         raise HTTPException(status_code=400, detail="Upload ID not found")
 
@@ -228,6 +218,7 @@ def upload_complete(
     final_path = container_dir / safe_filename
 
     try:
+        # Step 1: Assemble chunks
         with open(final_path, "wb") as final_file:
             for index in range(total_chunks):
                 chunk_path = chunks[index]
@@ -237,6 +228,32 @@ def upload_complete(
                         final_file.write(block)
 
                 chunk_path.unlink(missing_ok=True)
+
+        # Step 2: Convert to COG format
+        cog_path = final_path.with_suffix('.cog.tif')
+        
+        try:
+            # Use gdal_translate to create COG
+            subprocess.run([
+                'gdal_translate',
+                str(final_path),
+                str(cog_path),
+                '-of', 'COG',
+                '-co', 'COMPRESS=DEFLATE',
+                '-co', 'BLOCKSIZE=512',
+                '-co', 'OVERVIEW_RESAMPLING=BILINEAR',
+                '-co', 'QUALITY=90',
+                '-co', 'BIGTIFF=IF_SAFER'
+            ], check=True, capture_output=True, text=True)
+            
+            # Replace original with COG
+            final_path.unlink()
+            cog_path.rename(final_path)
+            
+        except subprocess.CalledProcessError as e:
+            # If gdal_translate fails, keep original file
+            cog_path.unlink(missing_ok=True)
+            print(f"COG conversion failed: {e.stderr}")
 
     except Exception:
         final_path.unlink(missing_ok=True)
@@ -254,7 +271,6 @@ def upload_complete(
         "container": safe_container_name,
     }
 
-
 @app.delete("/api/files/{filename:path}")
 def delete_file(filename: str):
     """Delete a GeoTIFF and clear generated previews."""
@@ -263,7 +279,6 @@ def delete_file(filename: str):
     clear_preview_cache()
 
     return {"status": "deleted", "filename": filename}
-
 
 @app.get("/api/metadata")
 def get_metadata(filename: str = Query(...)):
@@ -289,7 +304,6 @@ def get_metadata(filename: str = Query(...)):
             detail=f"Failed to read metadata: {str(error)}",
         )
 
-
 @app.get("/api/thumbnail")
 def get_thumbnail(filename: str = Query(...)):
     """Create a small bright thumbnail for the sidebar."""
@@ -310,20 +324,20 @@ def get_thumbnail(filename: str = Query(...)):
             detail=f"Failed to generate thumbnail: {str(error)}",
         )
 
-
 @app.get("/api/image")
 def get_image(
     filename: str = Query(...),
     min_val: Optional[float] = Query(None),
     max_val: Optional[float] = Query(None),
+    max_size: int = Query(1000),
 ):
     """Create a cached bright preview for a single raster."""
     file_path = validate_file_exists(filename)
-    cache_key = f"image:{filename}:{min_val}:{max_val}"
+    cache_key = f"image:{filename}:{min_val}:{max_val}:{max_size}"
 
     try:
         with rasterio.open(file_path) as src:
-            data = read_preview_band(src, max_size=PREVIEW_MAX_SIZE)
+            data = read_preview_band(src, max_size=max_size)
 
             display_data = manual_or_auto_stretch(
                 data,
@@ -341,7 +355,6 @@ def get_image(
             detail=f"Failed to render image: {str(error)}",
         )
 
-
 @app.get("/api/rgb-composite")
 def get_rgb_composite(
     r_file: str = Query(...),
@@ -353,11 +366,12 @@ def get_rgb_composite(
     g_max: Optional[float] = Query(None),
     b_min: Optional[float] = Query(None),
     b_max: Optional[float] = Query(None),
+    max_size: int = Query(1000),
 ):
     """Create a cached, automatically brightened RGB composite."""
     cache_key = (
         f"rgb:{r_file}:{g_file}:{b_file}:"
-        f"{r_min}:{r_max}:{g_min}:{g_max}:{b_min}:{b_max}"
+        f"{r_min}:{r_max}:{g_min}:{g_max}:{b_min}:{b_max}:{max_size}"
     )
 
     try:
@@ -373,7 +387,7 @@ def get_rgb_composite(
             out_width, out_height = preview_dimensions(
                 r_src.width,
                 r_src.height,
-                PREVIEW_MAX_SIZE,
+                max_size,
             )
 
             r_data = r_src.read(
@@ -382,14 +396,12 @@ def get_rgb_composite(
                 resampling=Resampling.bilinear,
                 masked=True,
             )
-
             g_data = g_src.read(
                 1,
                 out_shape=(out_height, out_width),
                 resampling=Resampling.bilinear,
                 masked=True,
             )
-
             b_data = b_src.read(
                 1,
                 out_shape=(out_height, out_width),
@@ -411,7 +423,6 @@ def get_rgb_composite(
             status_code=500,
             detail=f"Failed to generate RGB composite: {str(error)}",
         )
-
 
 @app.get("/api/histogram")
 def get_histogram(
@@ -455,7 +466,6 @@ def get_histogram(
             status_code=500,
             detail=f"Failed to calculate histogram: {str(error)}",
         )
-
 
 @app.get("/api/scatter-plot")
 def get_scatter_plot(
@@ -546,7 +556,6 @@ def get_scatter_plot(
             detail=f"Failed to generate scatter plot: {str(error)}",
         )
 
-
 @app.get("/api/profile-plot")
 def get_profile_plot(
     filename: str = Query(...),
@@ -602,7 +611,6 @@ def get_profile_plot(
             detail=f"Failed to generate profile plot: {str(error)}",
         )
 
-
 @app.get("/api/health")
 def health_check():
     return {
@@ -611,7 +619,6 @@ def health_check():
         "preview_max_size": PREVIEW_MAX_SIZE,
         "cached_previews": len(preview_cache),
     }
-
 
 if __name__ == "__main__":
     import uvicorn
