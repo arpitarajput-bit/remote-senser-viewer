@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Optional
 import math
 import subprocess
+from fastapi import Query
+from fastapi.responses import Response
+from rasterio.windows import Window
+import numpy as np
 
+TILE_SIZE = 256
 PREVIEW_MAX_SIZE = 1000
 THUMBNAIL_MAX_SIZE = 200
 JPEG_QUALITY = 82
@@ -20,7 +25,7 @@ app = FastAPI()
 # Fixed CORS for Codespaces
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*-5173\.app\.github\.dev",
+    allow_origin_regex=r"https://.*-\d+\.app\.github\.dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -233,7 +238,6 @@ def upload_complete(
         cog_path = final_path.with_suffix('.cog.tif')
         
         try:
-            # Use gdal_translate to create COG
             subprocess.run([
                 'gdal_translate',
                 str(final_path),
@@ -246,12 +250,10 @@ def upload_complete(
                 '-co', 'BIGTIFF=IF_SAFER'
             ], check=True, capture_output=True, text=True)
             
-            # Replace original with COG
             final_path.unlink()
             cog_path.rename(final_path)
             
         except subprocess.CalledProcessError as e:
-            # If gdal_translate fails, keep original file
             cog_path.unlink(missing_ok=True)
             print(f"COG conversion failed: {e.stderr}")
 
@@ -353,6 +355,108 @@ def get_image(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to render image: {str(error)}",
+        )
+
+@app.get("/api/image-chunk")
+def get_image_chunk(
+    filename: str = Query(...),
+    chunk: int = Query(0),
+    max_size: int = Query(1000),
+):
+    """Serve image in 4 chunks (quadrants) for progressive loading."""
+    file_path = validate_file_exists(filename)
+    
+    try:
+        with rasterio.open(file_path) as src:
+            out_width, out_height = preview_dimensions(src.width, src.height, max_size)
+            data = src.read(
+                1,
+                out_shape=(out_height, out_width),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+            
+            display_data = brighten_preview(data, nodata=src.nodata)
+            
+            h, w = display_data.shape
+            mid_h, mid_w = h // 2, w // 2
+            
+            quadrants = {
+                0: display_data[:mid_h, :mid_w],
+                1: display_data[:mid_h, mid_w:],
+                2: display_data[mid_h:, :mid_w],
+                3: display_data[mid_h:, mid_w:],
+            }
+            
+            quadrant_data = quadrants.get(chunk, display_data)
+            
+            image = Image.fromarray(quadrant_data, mode="L").convert("RGB")
+            
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=82, optimize=True)
+            
+            return StreamingResponse(
+                BytesIO(buffer.getvalue()),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"}
+            )
+            
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render image chunk: {str(error)}",
+        )
+@app.get("/api/tile")
+def get_tile(
+    filename: str = Query(...),
+    z: int = Query(...),
+    x: int = Query(...),
+    y: int = Query(...),
+):
+    """Serve a 256x256 tile from the raster for the given zoom level."""
+    file_path = validate_file_exists(filename)   # ← resolves the real path in STORAGE_DIR
+
+    try:
+        with rasterio.open(file_path) as src:
+            scale = 2 ** z
+            tile_w = src.width / scale
+            tile_h = src.height / scale
+
+            left = x * tile_w
+            top = y * tile_h
+            right = min(src.width, left + tile_w)
+            bottom = min(src.height, top + tile_h)
+
+            if left >= src.width or top >= src.height:
+                return Response(status_code=204)
+
+            window = Window.from_slices((top, bottom), (left, right))
+            data = src.read(1, window=window, masked=True)
+
+            # Normalize to 0-255 with 2-98 percentile stretch
+            arr = np.asarray(np.ma.filled(data, np.nan), dtype=np.float32)
+            valid = np.isfinite(arr)
+            if np.count_nonzero(valid) == 0:
+                img = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+            else:
+                lo, hi = np.nanpercentile(arr[valid], 2), np.nanpercentile(arr[valid], 98)
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    lo, hi = float(np.nanmin(arr[valid])), float(np.nanmax(arr[valid]))
+                norm = np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+
+                img = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+                h = min(TILE_SIZE, norm.shape[0])
+                w = min(TILE_SIZE, norm.shape[1])
+                img[:h, :w] = norm[:h, :w]
+
+        out = BytesIO()
+        Image.fromarray(img, mode="L").save(out, format="PNG")
+        return Response(content=out.getvalue(), media_type="image/png")
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render tile: {str(error)}",
         )
 
 @app.get("/api/rgb-composite")
