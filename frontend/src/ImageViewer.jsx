@@ -171,6 +171,11 @@ const [loadingChunks, setLoadingChunks] = useState([]);
   const [imageUrl, setImageUrl] = useState("");
   const [displayedImageUrl, setDisplayedImageUrl] = useState("");
   const [isImageLoading, setIsImageLoading] = useState(false);
+  // The low-resolution preview is shown in BOTH the viewport and minimap
+  // as soon as it arrives. OpenSeadragon loads its deep-zoom tiles in parallel
+  // and replaces the preview after the viewer is ready.
+  const [showOverviewInViewport, setShowOverviewInViewport] = useState(false);
+  const [osdReady, setOsdReady] = useState(false);
   const [viewMode, setViewMode] = useState("");
   const [toast, setToast] = useState(null);
 
@@ -187,6 +192,7 @@ const [loadingChunks, setLoadingChunks] = useState([]);
 
   const containerRef = useRef(null);
   const imgRef = useRef(null);
+  const overviewImgRef = useRef(null);
   const abortControllerRef = useRef(null);
   const activeObjectUrlRef = useRef(null);
   const thumbnailCacheRef = useRef({});
@@ -199,6 +205,11 @@ const [loadingChunks, setLoadingChunks] = useState([]);
   const historyContextRef = useRef(null);
 const viewerRef = useRef(null);
 const osdContainerRef = useRef(null);
+const loadSequenceRef = useRef(0);
+const osdFirstTileRef = useRef(false);
+const lastViewedFileByContainerRef = useRef({});
+const viewerInteractionRef = useRef({ dragging: false, lastX: 0, lastY: 0, moved: false, suppressClick: false });
+const currentRasterSizeRef = useRef({ width: 1, height: 1 });
 
   const containerRgbRef = useRef({});
   const containerStretchRef = useRef({});
@@ -217,7 +228,8 @@ const osdContainerRef = useRef(null);
   const saveCurrentImageHistory = () => {
     const context = historyContextRef.current;
     if (!context?.key) return;
-    imageHistoryRef.current[context.key] = {
+
+    const record = {
       containerName: context.containerName,
       baseFile: context.baseFile,
       selectedFile: selectedFile || null,
@@ -235,8 +247,26 @@ const osdContainerRef = useRef(null);
       position: { ...position },
       displayedImageUrl,
     };
-  };
 
+    if (viewerRef.current?.viewport) {
+      try {
+        const viewport = viewerRef.current.viewport;
+        const center = viewport.getCenter();
+        const homeZoom = viewport.getHomeZoom();
+        record.osdZoom = viewport.getZoom();
+        record.osdCenter = { x: center.x, y: center.y };
+        record.osdHomeZoom = homeZoom;
+        record.scale = homeZoom > 0 ? viewport.getZoom() / homeZoom : scale;
+      } catch (error) {
+        // Viewer may be between destroy/open; keep the last React values.
+      }
+    }
+
+    imageHistoryRef.current[context.key] = record;
+    if (context.containerName && context.baseFile) {
+      lastViewedFileByContainerRef.current[context.containerName] = context.baseFile;
+    }
+  };
 
   const getSavedImageHistory = (containerName, filename) => {
     const key = getHistoryKey(containerName, filename);
@@ -342,38 +372,226 @@ const osdContainerRef = useRef(null);
 // low-res tiles almost immediately, and OSD automatically requests
 // higher-resolution tiles (via /api/tile or /api/rgb-tile) for whatever
 // region you zoom into, swapping them in as they arrive.
-const buildAndShowTiles = async (tileParams) => {
+const waitForRasterMetadata = async (filename, attempts = 14, delayMs = 500) => {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const res = await axios.get(`${API}/metadata`, { params: { filename }, timeout: 4500 });
+      if (res?.data?.width && res?.data?.height) return res.data;
+      lastError = new Error("Metadata response did not contain raster dimensions.");
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError || new Error("Raster metadata is not available yet.");
+};
+
+const buildOverviewUrl = (url) => {
+  const parsed = new URL(url);
+  const cacheBust = `_t=${Date.now()}`;
+
+  if (parsed.pathname.endsWith("/rgb-composite")) {
+    const params = new URLSearchParams({
+      r_file: parsed.searchParams.get("r_file") || "",
+      g_file: parsed.searchParams.get("g_file") || "",
+      b_file: parsed.searchParams.get("b_file") || "",
+      max_size: "600",
+      _t: String(Date.now()),
+    });
+    ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
+      const value = parsed.searchParams.get(key);
+      if (value !== null && value !== "") params.set(key, value);
+    });
+    return `${API}/rgb-overview?${params.toString()}`;
+  }
+
+  const filename = parsed.searchParams.get("filename");
+  const minVal = parsed.searchParams.get("min_val");
+  const maxVal = parsed.searchParams.get("max_val");
+  const params = new URLSearchParams({
+    filename: filename || "",
+    max_size: "600",
+    _t: String(Date.now()),
+  });
+  if (minVal !== null && minVal !== "") params.set("min_val", minVal);
+  if (maxVal !== null && maxVal !== "") params.set("max_val", maxVal);
+  return `${API}/overview?${params.toString()}`;
+};
+
+const buildFastPreviewUrl = (url) => {
+  const parsed = new URL(url);
+  const stamp = Date.now();
+  if (parsed.pathname.endsWith("/rgb-composite")) {
+    const params = new URLSearchParams({
+      r_file: parsed.searchParams.get("r_file") || "",
+      g_file: parsed.searchParams.get("g_file") || "",
+      b_file: parsed.searchParams.get("b_file") || "",
+      max_size: "320",
+      _t: String(stamp),
+    });
+    ["r_min","r_max","g_min","g_max","b_min","b_max"].forEach((key) => {
+      const value = parsed.searchParams.get(key);
+      if (value !== null && value !== "") params.set(key, value);
+    });
+    return `${API}/rgb-overview?${params.toString()}`;
+  }
+  const filename = parsed.searchParams.get("filename");
+  if (!filename || !parsed.pathname.endsWith("/image")) return null;
+  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&max_size=480&_t=${stamp}`;
+};
+
+const loadVerifiedOverview = async (url, requestId) => {
+  const overviewUrl = buildOverviewUrl(url);
+  const fastPreviewUrl = buildFastPreviewUrl(url);
+  const deadline = Date.now() + 9500;
+  let lastError = null;
+  let hasPublishedOverview = false;
+
+  const publishObjectUrl = (objectUrl) => {
+    if (requestId !== loadSequenceRef.current) {
+      URL.revokeObjectURL(objectUrl);
+      return false;
+    }
+    if (activeObjectUrlRef.current) {
+      URL.revokeObjectURL(activeObjectUrlRef.current);
+    }
+    activeObjectUrlRef.current = objectUrl;
+    setDisplayedImageUrl(objectUrl);
+    setShowOverviewInViewport(!osdFirstTileRef.current);
+    setIsImageLoading(false);
+    hasPublishedOverview = true;
+    return true;
+  };
+
+  const tryFetchImage = async (imageUrl, timeoutMs) => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(imageUrl, {
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Overview request failed: ${response.status}`);
+      const blob = await response.blob();
+      if (!blob || blob.size === 0) throw new Error("Overview response was empty.");
+      return URL.createObjectURL(blob);
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  };
+
+  while (Date.now() < deadline && requestId === loadSequenceRef.current) {
+    const remaining = Math.max(500, deadline - Date.now());
+
+    // Fast path: publish a compact full-extent preview as soon as possible.
+    // It is used simultaneously by the viewport and minimap.
+    if (!hasPublishedOverview && fastPreviewUrl) {
+      try {
+        const objectUrl = await tryFetchImage(fastPreviewUrl, Math.min(1200, remaining));
+        if (!publishObjectUrl(objectUrl)) return false;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (requestId !== loadSequenceRef.current) return false;
+
+    // Once a low-res overview exists, try to replace it with the larger 600px
+    // full-extent overview. This does not block initial display.
+    if (remaining > 700) {
+      try {
+        const objectUrl = await tryFetchImage(overviewUrl, Math.min(2200, remaining));
+        if (publishObjectUrl(objectUrl)) return true;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (hasPublishedOverview) {
+      // Keep the currently visible full-extent overview and let the deep-zoom
+      // viewer continue independently. There is no reason to hide it because
+      // the higher quality overview missed a retry window.
+      setIsImageLoading(false);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  if (requestId === loadSequenceRef.current && hasPublishedOverview) {
+    setIsImageLoading(false);
+    return true;
+  }
+
+  console.warn("Raster overview could not be loaded within 10 seconds:", lastError);
+  return false;
+};
+
+const updateMiniRectFromViewer = (width, height, viewer = viewerRef.current) => {
+  if (!viewer?.viewport || !width || !height) return;
+  try {
+    // Convert the ACTUAL viewport bounds directly into raster/image pixels.
+    // The minimap is display-only; it simply mirrors this rectangle.
+    const viewportBounds = viewer.viewport.getBounds(true);
+    const imageBounds = viewer.viewport.viewportToImageRectangle(viewportBounds);
+
+    const left = Math.max(0, Math.min(1, imageBounds.x / width));
+    const top = Math.max(0, Math.min(1, imageBounds.y / height));
+    const right = Math.max(left, Math.min(1, (imageBounds.x + imageBounds.width) / width));
+    const bottom = Math.max(top, Math.min(1, (imageBounds.y + imageBounds.height) / height));
+
+    setMiniRect({
+      left,
+      top,
+      width: Math.max(0, Math.min(1, right - left)),
+      height: Math.max(0, Math.min(1, bottom - top)),
+    });
+  } catch (error) {
+    // Ignore transient viewer lifecycle changes.
+  }
+};
+
+const buildAndShowTiles = async (tileParams, requestId, restoreViewport = null) => {
+  if (viewerInteractionRef.current.cleanup) {
+    viewerInteractionRef.current.cleanup();
+    viewerInteractionRef.current.cleanup = null;
+  }
   if (viewerRef.current) {
     viewerRef.current.destroy();
     viewerRef.current = null;
   }
-  if (!osdContainerRef.current) return;
+  if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
   const metaFile = tileParams.type === "rgb" ? tileParams.r : tileParams.file;
   if (!metaFile) return;
 
   setIsImageLoading(true);
+  setOsdReady(false);
+  osdFirstTileRef.current = false;
 
   try {
-    const res = await axios.get(`${API}/metadata`, { params: { filename: metaFile } });
-    const { width, height } = res.data;
-    if (!osdContainerRef.current) return; // unmounted / swiped away mid-fetch
+    const metadata = await waitForRasterMetadata(metaFile);
+    const { width, height } = metadata;
+    currentRasterSizeRef.current = { width, height };
+    if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
     const maxLevel = computeMaxLevel(width, height);
 
     const buildRasterTileUrl = (level, x, y) => {
-      let url = `${API}/tile?filename=${encodeURIComponent(tileParams.file)}&z=${level}&x=${x}&y=${y}`;
-      if (tileParams.min !== "" && tileParams.min != null) url += `&min_val=${encodeURIComponent(tileParams.min)}`;
-      if (tileParams.max !== "" && tileParams.max != null) url += `&max_val=${encodeURIComponent(tileParams.max)}`;
-      return url;
+      let tileUrl = `${API}/tile?filename=${encodeURIComponent(tileParams.file)}&z=${level}&x=${x}&y=${y}`;
+      if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
+      if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
+      return tileUrl;
     };
 
     const buildRgbTileUrl = (level, x, y) => {
-      let url = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
+      let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
       [["r_min", tileParams.rMin], ["r_max", tileParams.rMax], ["g_min", tileParams.gMin], ["g_max", tileParams.gMax], ["b_min", tileParams.bMin], ["b_max", tileParams.bMax]].forEach(([key, val]) => {
-        if (val !== "" && val != null) url += `&${key}=${encodeURIComponent(val)}`;
+        if (val !== "" && val != null) tileUrl += `&${key}=${encodeURIComponent(val)}`;
       });
-      return url;
+      return tileUrl;
     };
 
     const tileSource = {
@@ -393,93 +611,294 @@ const buildAndShowTiles = async (tileParams) => {
       useCanvas: true,
       tileSources: tileSource,
       showNavigationControl: false,
-      gestureSettingsMouse: { clickToZoom: false },
+      // Use explicit pointer handlers below. Keeping OSD mouse navigation off
+      // avoids competing event handlers while still controlling the REAL image
+      // viewport directly through viewport.zoomBy()/panBy().
+      gestureSettingsMouse: {
+        clickToZoom: false,
+        dblClickToZoom: false,
+        dragToPan: false,
+        scrollToZoom: false,
+      },
+      homeFillsViewer: false,
+      visibilityRatio: 1,
+      constrainDuringPan: true,
+      minZoomImageRatio: 1,
+      maxZoomPixelRatio: 4,
+      zoomPerScroll: 1.2,
+      animationTime: 0.8,
+      mouseNavEnabled: false,
+      immediateRender: true,
+      imageLoaderLimit: 6,
+      maxImageCacheCount: 256,
+      smoothTileEdgesMinZoom: 1.0,
     });
 
-    viewerRef.current.addOnceHandler("open", () => setIsImageLoading(false));
-    viewerRef.current.addOnceHandler("open-failed", () => {
-      setIsImageLoading(false);
-      showToast("Failed to load image tiles.", "error");
+    // The main viewport is the ONLY source of zoom/pan truth.
+    // The minimap is display-only and is updated from viewport changes.
+    const surface = osdContainerRef.current;
+    const viewer = viewerRef.current;
+    if (surface && viewer) {
+      surface.style.cursor = "grab";
+      surface.style.touchAction = "none";
+      surface.style.userSelect = "none";
+
+      const interaction = viewerInteractionRef.current;
+      const onWheel = (event) => {
+        if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
+        event.preventDefault();
+        event.stopPropagation();
+
+        const rect = surface.getBoundingClientRect();
+        const pixel = new OpenSeadragon.Point(
+          event.clientX - rect.left,
+          event.clientY - rect.top
+        );
+        const refPoint = viewer.viewport.pointFromPixel(pixel, true);
+        const factor = event.deltaY < 0 ? 1.25 : 0.8;
+
+        viewer.viewport.zoomBy(factor, refPoint, true);
+        viewer.viewport.applyConstraints();
+        userHasSetViewRef.current = true;
+        updateMiniRectFromViewer(width, height, viewer);
+        saveCurrentImageHistory();
+      };
+
+      const onPointerDown = (event) => {
+        if (requestId !== loadSequenceRef.current || event.button !== 0 || !viewer.viewport) return;
+
+        interaction.dragging = true;
+        interaction.moved = false;
+        interaction.lastX = event.clientX;
+        interaction.lastY = event.clientY;
+        surface.style.cursor = "grabbing";
+
+        try {
+          surface.setPointerCapture(event.pointerId);
+        } catch (_) {}
+
+        event.preventDefault();
+        event.stopPropagation();
+      };
+
+      const onPointerMove = (event) => {
+        if (!interaction.dragging || requestId !== loadSequenceRef.current || !viewer.viewport) return;
+
+        const dx = event.clientX - interaction.lastX;
+        const dy = event.clientY - interaction.lastY;
+        if (Math.abs(dx) + Math.abs(dy) > 1) interaction.moved = true;
+
+        interaction.lastX = event.clientX;
+        interaction.lastY = event.clientY;
+
+        const delta = viewer.viewport.deltaPointsFromPixels(
+          new OpenSeadragon.Point(dx, dy),
+          true
+        );
+        viewer.viewport.panBy(delta.times(-1), true);
+        viewer.viewport.applyConstraints();
+        userHasSetViewRef.current = true;
+        updateMiniRectFromViewer(width, height, viewer);
+
+        event.preventDefault();
+        event.stopPropagation();
+      };
+
+      const finishPointer = (event) => {
+        if (!interaction.dragging) return;
+        interaction.dragging = false;
+        surface.style.cursor = "grab";
+        try {
+          surface.releasePointerCapture(event.pointerId);
+        } catch (_) {}
+        saveCurrentImageHistory();
+        event.preventDefault();
+        event.stopPropagation();
+      };
+
+      const onDoubleClick = (event) => {
+        if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
+
+        const rect = surface.getBoundingClientRect();
+        const pixel = new OpenSeadragon.Point(
+          event.clientX - rect.left,
+          event.clientY - rect.top
+        );
+        const refPoint = viewer.viewport.pointFromPixel(pixel, true);
+
+        viewer.viewport.zoomBy(2, refPoint, true);
+        viewer.viewport.applyConstraints();
+        userHasSetViewRef.current = true;
+        updateMiniRectFromViewer(width, height, viewer);
+        saveCurrentImageHistory();
+        event.preventDefault();
+        event.stopPropagation();
+      };
+
+      surface.addEventListener("wheel", onWheel, { passive: false });
+      surface.addEventListener("pointerdown", onPointerDown);
+      surface.addEventListener("pointermove", onPointerMove);
+      surface.addEventListener("pointerup", finishPointer);
+      surface.addEventListener("pointercancel", finishPointer);
+      surface.addEventListener("dblclick", onDoubleClick);
+
+      viewerInteractionRef.current.cleanup = () => {
+        surface.removeEventListener("wheel", onWheel);
+        surface.removeEventListener("pointerdown", onPointerDown);
+        surface.removeEventListener("pointermove", onPointerMove);
+        surface.removeEventListener("pointerup", finishPointer);
+        surface.removeEventListener("pointercancel", finishPointer);
+        surface.removeEventListener("dblclick", onDoubleClick);
+        surface.style.cursor = "default";
+        surface.style.touchAction = "";
+        surface.style.userSelect = "";
+      };
+    }
+
+    viewerRef.current.addOnceHandler("open", () => {
+      if (requestId !== loadSequenceRef.current) return;
+      setOsdReady(true);
+      const viewer = viewerRef.current;
+      if (viewer) {
+        viewer.viewport.goHome(true);
+        viewer.viewport.applyConstraints();
+
+        const restore = restoreViewport && Number.isFinite(restoreViewport.osdZoom) && restoreViewport.osdCenter
+          ? restoreViewport
+          : null;
+
+        requestAnimationFrame(() => {
+          if (!viewerRef.current || requestId !== loadSequenceRef.current) return;
+          const currentViewer = viewerRef.current;
+          currentViewer.viewport.goHome(true);
+          currentViewer.viewport.applyConstraints();
+          if (restore) {
+            currentViewer.viewport.zoomTo(restore.osdZoom, null, true);
+            currentViewer.viewport.panTo(
+              new OpenSeadragon.Point(restore.osdCenter.x, restore.osdCenter.y),
+              true
+            );
+            currentViewer.viewport.applyConstraints();
+          }
+          updateMiniRectFromViewer(width, height, currentViewer);
+        });
+      }
     });
-  } catch (err) {
-    console.error("Failed to load tile metadata:", err);
-    setIsImageLoading(false);
-    showToast("Failed to load image metadata.", "error");
+
+    viewerRef.current.addHandler("viewport-change", () => {
+      if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
+      const viewer = viewerRef.current;
+      const homeZoom = viewer.viewport.getHomeZoom();
+      const zoom = viewer.viewport.getZoom();
+      setScale(homeZoom > 0 ? zoom / homeZoom : 1);
+      updateMiniRectFromViewer(width, height, viewer);
+      saveCurrentImageHistory();
+    });
+
+
+    viewerRef.current.addHandler("animation-finish", () => {
+      if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
+      updateMiniRectFromViewer(width, height, viewerRef.current);
+      saveCurrentImageHistory();
+    });
+
+    viewerRef.current.addOnceHandler("tile-drawn", () => {
+      if (requestId !== loadSequenceRef.current) return;
+      osdFirstTileRef.current = true;
+      setShowOverviewInViewport(false);
+    });
+
+    viewerRef.current.addHandler("resize", () => {
+      const viewer = viewerRef.current;
+      if (!viewer || requestId !== loadSequenceRef.current) return;
+      if (viewer.viewport.getZoom() <= viewer.viewport.getHomeZoom() * 1.01) {
+        viewer.viewport.goHome(true);
+      }
+    });
+
+    viewerRef.current.addOnceHandler("open-failed", () => {
+      if (requestId !== loadSequenceRef.current) return;
+      setOsdReady(false);
+      // Keep the overview visible. A tiled viewer failure should not blank the map.
+    });
+  } catch (error) {
+    console.error("Failed to initialize tiled viewer:", error);
+    if (requestId === loadSequenceRef.current) setOsdReady(false);
   }
 };
 
-const loadImage = (url, viewKey = null, preserveView = false) => {
+const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = null) => {
+  const requestId = loadSequenceRef.current + 1;
+  loadSequenceRef.current = requestId;
+
   if (abortControllerRef.current) abortControllerRef.current.abort();
+  if (viewerInteractionRef.current.cleanup) {
+    viewerInteractionRef.current.cleanup();
+    viewerInteractionRef.current.cleanup = null;
+  }
+  if (viewerRef.current) {
+    viewerRef.current.destroy();
+    viewerRef.current = null;
+  }
   if (activeObjectUrlRef.current) {
     URL.revokeObjectURL(activeObjectUrlRef.current);
     activeObjectUrlRef.current = null;
   }
+
   abortControllerRef.current = new AbortController();
   setImageUrl(url);
+  userHasSetViewRef.current = Boolean(restoreViewport);
+  setOsdReady(false);
+  osdFirstTileRef.current = false;
+  // Immediately detach the previous raster so another container can never
+  // leave its old minimap/overview visible while the new raster loads.
+  setDisplayedImageUrl("");
+  setShowOverviewInViewport(false);
+  setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
   setIsImageLoading(true);
+  currentViewKeyRef.current = viewKey;
 
-  // Derive tile parameters from the same URL used for the flat preview
-  // (used for the minimap thumbnail below) and drive the real tiled
-  // OpenSeadragon viewport from them. This piggybacks on every existing
-  // call site of loadImage (select raster, apply stretch, switch RGB
-  // channel, switch container, exit swipe mode, etc.) without needing to
-  // touch each of them individually.
+  let parsed;
   try {
-    const parsed = new URL(url);
-    if (parsed.pathname.endsWith("/rgb-composite")) {
-      buildAndShowTiles({
-        type: "rgb",
-        r: parsed.searchParams.get("r_file"),
-        g: parsed.searchParams.get("g_file"),
-        b: parsed.searchParams.get("b_file"),
-        rMin: parsed.searchParams.get("r_min"),
-        rMax: parsed.searchParams.get("r_max"),
-        gMin: parsed.searchParams.get("g_min"),
-        gMax: parsed.searchParams.get("g_max"),
-        bMin: parsed.searchParams.get("b_min"),
-        bMax: parsed.searchParams.get("b_max"),
-      });
-    } else if (parsed.pathname.endsWith("/image")) {
-      buildAndShowTiles({
-        type: "raster",
-        file: parsed.searchParams.get("filename"),
-        min: parsed.searchParams.get("min_val"),
-        max: parsed.searchParams.get("max_val"),
-      });
-    }
-  } catch (err) {
-    console.error("Failed to derive tile source from URL:", err);
+    parsed = new URL(url);
+  } catch (error) {
+    console.error("Invalid image URL:", error);
+    setIsImageLoading(false);
+    return;
   }
 
-    const preloader = new Image();
-    preloader.onload = (e) => {
-      setDisplayedImageUrl(url);
-      setIsImageLoading(false);
-      currentViewKeyRef.current = viewKey;
+  // Start both operations at the same time:
+  // 1) a fast, full-extent low-resolution overview for viewport + minimap
+  // 2) OpenSeadragon metadata/tile initialization for map-style zoom and pan
+  if (parsed.pathname.endsWith("/rgb-composite")) {
+    buildAndShowTiles({
+      type: "rgb",
+      r: parsed.searchParams.get("r_file"),
+      g: parsed.searchParams.get("g_file"),
+      b: parsed.searchParams.get("b_file"),
+      rMin: parsed.searchParams.get("r_min"),
+      rMax: parsed.searchParams.get("r_max"),
+      gMin: parsed.searchParams.get("g_min"),
+      gMax: parsed.searchParams.get("g_max"),
+      bMin: parsed.searchParams.get("b_min"),
+      bMax: parsed.searchParams.get("b_max"),
+    }, requestId, restoreViewport);
+  } else if (parsed.pathname.endsWith("/image")) {
+    buildAndShowTiles({
+      type: "raster",
+      file: parsed.searchParams.get("filename"),
+      min: parsed.searchParams.get("min_val"),
+      max: parsed.searchParams.get("max_val"),
+    }, requestId, restoreViewport);
+  }
 
-
-      const shouldAutoFit =
-        !userHasSetViewRef.current &&
-        scale === 1 &&
-        position.x === 0 &&
-        position.y === 0 &&
-        containerRef.current;
-
-
-      if (shouldAutoFit && containerRef.current) {
-        const cw = containerRef.current.clientWidth;
-        const ch = containerRef.current.clientHeight;
-        const iw = e.target.naturalWidth;
-        const ih = e.target.naturalHeight;
-        if (iw > 0 && ih > 0) {
-          const ratio = Math.min(cw / iw, ch / ih) * 0.95;
-          setScale(Math.max(MIN_SCALE, Math.min(ratio, 1)));
-          setPosition({ x: 0, y: 0 });
-        }
-      }
-    };
-    preloader.src = url;
-  };
+  loadVerifiedOverview(url, requestId).then((loaded) => {
+    if (!loaded && requestId === loadSequenceRef.current) {
+      // Keep the loading state visible instead of showing a broken image.
+      setIsImageLoading(true);
+    }
+  });
+};
 
   // Tear down the OSD viewer whenever swipe mode is entered — its
   // container div gets unmounted while in swipe mode, so the viewer
@@ -515,25 +934,16 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
 
   useEffect(() => {
     const updateMini = () => {
-      if (!imgRef.current || !containerRef.current) return;
-      const imgRect = imgRef.current.getBoundingClientRect();
-      const contRect = containerRef.current.getBoundingClientRect();
-      const visLeft = Math.max(0, contRect.left - imgRect.left);
-      const visTop = Math.max(0, contRect.top - imgRect.top);
-      const visRight = Math.max(0, Math.min(imgRect.width, contRect.right - imgRect.left));
-      const visBottom = Math.max(0, Math.min(imgRect.height, contRect.bottom - imgRect.top));
-      const visW = Math.max(0, visRight - visLeft);
-      const visH = Math.max(0, visBottom - visTop);
-      const leftPct = visLeft / Math.max(imgRect.width, 1);
-      const topPct = visTop / Math.max(imgRect.height, 1);
-      const widthPct = visW / Math.max(imgRect.width, 1);
-      const heightPct = visH / Math.max(imgRect.height, 1);
-      setMiniRect({ left: leftPct, top: topPct, width: widthPct, height: heightPct });
+      if (viewerRef.current && rasterInfo?.width && rasterInfo?.height) {
+        updateMiniRectFromViewer(rasterInfo.width, rasterInfo.height, viewerRef.current);
+      } else if (displayedImageUrl) {
+        setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
+      }
     };
     updateMini();
     window.addEventListener("resize", updateMini);
     return () => window.removeEventListener("resize", updateMini);
-  }, [displayedImageUrl, scale, position, isDragging, isSwipeMode]);
+  }, [displayedImageUrl, rasterInfo?.width, rasterInfo?.height, isSwipeMode]);
 
 
   const buildSingleImageUrl = (filename, stretch) => {
@@ -911,59 +1321,23 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
 
 
   const resetView = () => {
-    if (rgbBeforeHistRef.current) {
-      const prev = rgbBeforeHistRef.current;
-      if (prev.r && prev.g && prev.b) {
-        setRFile(prev.r);
-        setGFile(prev.g);
-        setBFile(prev.b);
-
-
-        const noStretch = createEmptyStretchValues();
-        setStretchValues(noStretch);
-
-
-        if (activeContainer) {
-          containerStretchRef.current[activeContainer] = noStretch;
-        }
-
-
-        setViewMode("rgb");
-        setSelectedFile(null);
-        loadImage(
-          buildCompositeUrl(prev.r, prev.g, prev.b, noStretch),
-          compositeViewKey(prev.r, prev.g, prev.b),
-          false
-        );
-        rgbBeforeHistRef.current = null;
-        return;
-      }
-      rgbBeforeHistRef.current = null;
+    const viewer = viewerRef.current;
+    userHasSetViewRef.current = false;
+    if (viewer?.viewport) {
+      viewer.viewport.goHome(true);
+      viewer.viewport.applyConstraints();
+      saveCurrentImageHistory();
+      return;
     }
-
-
     setScale(1);
-    if (imgRef.current && containerRef.current) {
-      const cw = containerRef.current.clientWidth;
-      const ch = containerRef.current.clientHeight;
-      const iw = imgRef.current.naturalWidth || 0;
-      const ih = imgRef.current.naturalHeight || 0;
-      if (iw > 0 && ih > 0) {
-        setPosition({ x: (cw - iw) / 2, y: (ch - ih) / 2 });
-      } else {
-        setPosition({ x: 0, y: 0 });
-      }
-    } else {
-      setPosition({ x: 0, y: 0 });
-    }
-    userHasSetViewRef.current = true;
+    setPosition({ x: 0, y: 0 });
   };
-
 
   const handleSelectRaster = async (filename) => {
     if (isSwipeMode) return;
     saveCurrentImageHistory();
     const containerName = getContainerForFile(filename) || activeContainer;
+    if (containerName) lastViewedFileByContainerRef.current[containerName] = filename;
     const saved = getSavedImageHistory(containerName, filename);
     setHistoryContext(containerName, filename);
 
@@ -990,14 +1364,18 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
         setViewMode("rgb");
         loadImage(
           buildCompositeUrl(saved.rFile, saved.gFile, saved.bFile, saved.stretchValues),
-          compositeViewKey(saved.rFile, saved.gFile, saved.bFile)
+          compositeViewKey(saved.rFile, saved.gFile, saved.bFile),
+          false,
+          saved
         );
       } else {
         setSelectedFile(filename);
         setViewMode("raster");
         loadImage(
           buildSingleImageUrl(filename, saved.stretchValues?.default || { min: "", max: "" }),
-          rasterViewKey(filename)
+          rasterViewKey(filename),
+          false,
+          saved
         );
       }
 
@@ -1012,10 +1390,6 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
         setHistDefaultData(null);
       }
 
-
-      setTimeout(() => {
-        restoreContainerView(containerName);
-      }, 0);
     } else {
       setSelectedFile(filename);
       setViewMode("raster");
@@ -1034,10 +1408,6 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
       setHistB(null);
       loadImage(buildSingleImageUrl(filename, restoredStretch.default), rasterViewKey(filename));
 
-
-      setTimeout(() => {
-        if (containerName) restoreContainerView(containerName);
-      }, 0);
     }
 
 
@@ -1047,11 +1417,16 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
     }
 
 
+    const metadataRequestId = loadSequenceRef.current;
     try {
       const res = await axios.get(`${API}/metadata`, { params: { filename } });
-      setRasterInfo(res.data);
+      if (metadataRequestId === loadSequenceRef.current) {
+        setRasterInfo(res.data);
+      }
     } catch (err) {
-      console.error("Failed to load raster info:", err);
+      if (metadataRequestId === loadSequenceRef.current) {
+        console.error("Failed to load raster info:", err);
+      }
     }
   };
   const handleDeleteRaster = async (e, filename) => {
@@ -1479,55 +1854,22 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
 
 
   const handleZoomIn = () => {
-    setScale((p) => Math.min(p * 1.25, MAX_SCALE));
+    const viewer = viewerRef.current;
+    if (!viewer?.viewport) return;
     userHasSetViewRef.current = true;
-  };
-  const handleZoomOut = () => {
-    setScale((p) => Math.max(p / 1.25, MIN_SCALE));
-    userHasSetViewRef.current = true;
-  };
-  const handleWheel = (e) => {
-    e.preventDefault();
-    const z = e.deltaY < 0 ? 1.15 : 0.85;
-    setScale((p) => Math.min(Math.max(p * z, MIN_SCALE), MAX_SCALE));
-    userHasSetViewRef.current = true;
-  };
-  const handleMouseDown = (e) => {
-    if (e.button !== 0) return;
-    if (isProfileMode && imgRef.current) {
-      const rect = imgRef.current.getBoundingClientRect();
-      const clickX = (e.clientX - rect.left) / scale;
-      const clickY = (e.clientY - rect.top) / scale;
-      const nw = imgRef.current.naturalWidth || 100;
-      const nh = imgRef.current.naturalHeight || 100;
-      const fx = (rasterInfo?.width || nw) / nw;
-      const fy = (rasterInfo?.height || nh) / nh;
-      const rasterX = clickX * fx;
-      const rasterY = clickY * fy;
-      if (!isDrawingProfile) {
-        setProfileStart({ x: rasterX, y: rasterY });
-        setProfileEnd(null);
-        setIsDrawingProfile(true);
-      } else {
-        setProfileEnd({ x: rasterX, y: rasterY });
-        setIsDrawingProfile(false);
-        setIsProfileMode(false);
-        fetchProfilePlot(profileStart, { x: rasterX, y: rasterY }, profileFile, selectedProfileBand);
-      }
-      return;
-    }
-    setIsDragging(true);
-    setDragStart({ x: e.clientX - position.x, y: e.clientY - position.y });
-    userHasSetViewRef.current = true;
-  };
-  const handleMouseMove = (e) => {
-    if (!isDragging) return;
-    setPosition({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
-  };
-  const handleMouseUp = () => {
-    setIsDragging(false);
+    viewer.viewport.zoomBy(1.25);
+    viewer.viewport.applyConstraints();
+    saveCurrentImageHistory();
   };
 
+  const handleZoomOut = () => {
+    const viewer = viewerRef.current;
+    if (!viewer?.viewport) return;
+    userHasSetViewRef.current = true;
+    viewer.viewport.zoomBy(0.8);
+    viewer.viewport.applyConstraints();
+    saveCurrentImageHistory();
+  };
 
   const getImageStyle = useMemo(
     () => ({
@@ -1771,35 +2113,17 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
                       saveCurrentImageHistory();
                       setActiveContainer(containerName);
                       setActiveRgbContainer(containerName);
-                      const savedRgb = containerRgbRef.current[containerName];
-                      const savedStretch = containerStretchRef.current[containerName];
-                      const savedViewState = containerViewStateRef.current[containerName];
-                      if (savedViewState) {
-                        setScale(savedViewState.scale);
-                        setPosition(savedViewState.position);
-                      }
-                      const stretchToUse = savedStretch || createEmptyStretchValues();
-                      setStretchValues(stretchToUse);
-                      if (savedRgb && savedRgb.r && savedRgb.g && savedRgb.b) {
-                        setRFile(savedRgb.r);
-                        setGFile(savedRgb.g);
-                        setBFile(savedRgb.b);
-                        setViewMode("rgb");
-                        setSelectedFile(null);
-                        loadImage(
-                          buildCompositeUrl(savedRgb.r, savedRgb.g, savedRgb.b, stretchToUse),
-                          compositeViewKey(savedRgb.r, savedRgb.g, savedRgb.b),
-                          false
-                        );
-                      } else {
-                        autoSelectRGBForContainer(containerName);
-                      }
                       setHistActiveChannel(null);
                       setHistDropdownFile("");
                       setShowHistogram(false);
-                      setTimeout(() => {
-                        restoreContainerView(containerName);
-                      }, 0);
+
+                      const filesInContainer = containers[containerName] || [];
+                      const lastFile = lastViewedFileByContainerRef.current[containerName];
+                      const candidate = lastFile && filesInContainer.includes(lastFile)
+                        ? lastFile
+                        : filesInContainer[0];
+
+                      if (candidate) handleSelectRaster(candidate);
                     }}
                   >
                     <span style={{ flex: 1 }}>
@@ -1987,19 +2311,42 @@ const loadImage = (url, viewKey = null, preserveView = false) => {
               </div>
             </div>
           ) : (
-    <div
-      id="osd-viewer"
-      ref={osdContainerRef}
-      style={{ position: "absolute", inset: 0, background: "#07090c" }}
-    />
-  )}
+            <>
+              {/* Fast full-extent overview. It is the same image used by the minimap.
+                  It stays behind the real OpenSeadragon viewport and never captures input. */}
+              {displayedImageUrl && showOverviewInViewport && (
+                <img
+                  src={displayedImageUrl}
+                  alt="raster overview"
+                  draggable={false}
+                  onError={(e) => { e.currentTarget.style.display = "none"; }}
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    objectPosition: "center",
+                    zIndex: 5,
+                    pointerEvents: "none",
+                    userSelect: "none",
+                  }}
+                />
+              )}
+              <div
+                id="osd-viewer"
+                ref={osdContainerRef}
+                style={{ position: "absolute", inset: 0, background: "#07090c", zIndex: 10 }}
+              />
+            </>
+          )}
           {isImageLoading && !isSwipeMode && (
             <div style={styles.loadingBadge}>
-              <div style={styles.spinnerSmall} /><span>Loading tiles…</span>
+              <div style={styles.spinnerSmall} /><span>Loading image…</span>
             </div>
           )}
           {!isSwipeMode && displayedImageUrl && showMinimap && (
-            <div title="Navigation overview" onClick={(e) => { if (!imgRef.current || !containerRef.current) return; const miniEl = e.currentTarget.getBoundingClientRect(); const clickX = e.clientX - miniEl.left; const clickY = e.clientY - miniEl.top; const clickPctX = clickX / miniEl.width; const clickPctY = clickY / miniEl.height; const imgRect = imgRef.current.getBoundingClientRect(); const contRect = containerRef.current.getBoundingClientRect(); const clickDispX = clickPctX * imgRect.width; const clickDispY = clickPctY * imgRect.height; const desiredImgLeft = contRect.left + (contRect.width / 2) - clickDispX; const desiredImgTop = contRect.top + (contRect.height / 2) - clickDispY; const deltaX = desiredImgLeft - imgRect.left; const deltaY = desiredImgTop - imgRect.top; setPosition((prev) => ({ x: prev.x + deltaX, y: prev.y + deltaY })); }} style={{ ...styles.minimapContainer, right: (showHistogram || showScatterPlot || showProfileModal) ? "378px" : "18px" }}>
+            <div title="Current viewport location" style={{ ...styles.minimapContainer, right: (showHistogram || showScatterPlot || showProfileModal) ? "378px" : "18px", cursor: "default" }}>
               <img src={displayedImageUrl} alt="minimap" style={styles.minimapImage} draggable={false} />
               <div style={{ ...styles.miniViewportRect, left: `${miniRect.left * 100}%`, top: `${miniRect.top * 100}%`, width: `${Math.max(miniRect.width * 100, 1)}%`, height: `${Math.max(miniRect.height * 100, 1)}%` }} />
             </div>
@@ -2222,6 +2569,6 @@ const styles = {
   modalOptionBtn: { background: "#14171d", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "10px 14px", borderRadius: "6px", fontSize: "13px", fontWeight: "600", textAlign: "left", cursor: "pointer" },
   modalCancelBtn: { background: "transparent", border: "1px solid #2a2d34", color: "#94a3b8", padding: "8px", borderRadius: "6px", fontSize: "12px", width: "100%", cursor: "pointer" },
   minimapContainer: { position: "absolute", right: "18px", bottom: "18px", width: "300px", height: "220px", border: "1px solid rgba(255,255,255,0.06)", borderRadius: "6px", overflow: "hidden", background: "#0b0d11", boxShadow: "0 6px 18px rgba(0,0,0,0.6)", zIndex: 1200, cursor: "pointer" },
-  minimapImage: { width: "100%", height: "100%", objectFit: "cover", transform: "scale(1)", display: "block" },
+  minimapImage: { width: "100%", height: "100%", objectFit: "contain", objectPosition: "center", transform: "scale(1)", display: "block", backgroundColor: "#0b0d11" },
   miniViewportRect: { position: "absolute", border: "2px solid rgba(59,130,246,0.9)", boxSizing: "border-box", pointerEvents: "none", backgroundColor: "rgba(59,130,246,0.08)" },
 };

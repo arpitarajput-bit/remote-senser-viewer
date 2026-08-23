@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Optional
 import math
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+import os
 from fastapi import Query
 from fastapi.responses import Response
 from rasterio.windows import Window
@@ -36,10 +38,17 @@ STORAGE_DIR.mkdir(exist_ok=True)
 
 upload_chunks = {}
 preview_cache = {}
+auto_stretch_cache = {}
+
+# Large satellite rasters can take a long time to convert to COG.
+# Keep conversion in the background so the raw GeoTIFF can be previewed immediately.
+cog_executor = ThreadPoolExecutor(max_workers=2)
+cog_status = {}
 
 def clear_preview_cache():
-    """Clear previews after a file is uploaded or deleted."""
+    """Clear generated previews and cached global stretch limits."""
     preview_cache.clear()
+    auto_stretch_cache.clear()
 
 def get_file_path(filename: str) -> Path:
     """Return a safe, resolved file path inside storage."""
@@ -116,6 +125,46 @@ def brighten_preview(data, nodata=None, low_percentile=2, high_percentile=98):
 
     return np.clip(output, 0, 255).astype(np.uint8)
 
+def get_global_stretch_limits(src, band=1):
+    """Return one stable 2-98% stretch for the whole raster band.
+
+    The preview is sampled from the entire raster once and cached so adjacent
+    deep-zoom tiles use the same brightness mapping. This prevents the visible
+    tile-to-tile brightness seams produced by calculating percentiles per tile.
+    """
+    cache_key = f"{src.name}:{band}:{src.width}:{src.height}"
+    if cache_key in auto_stretch_cache:
+        return auto_stretch_cache[cache_key]
+
+    preview = read_preview_band(src, band=band, max_size=2000)
+    original_mask = np.ma.getmaskarray(preview)
+    arr = np.asarray(np.ma.filled(preview, np.nan), dtype=np.float32)
+    valid_mask = np.isfinite(arr) & ~original_mask
+    if src.nodata is not None:
+        valid_mask &= arr != src.nodata
+
+    # Ignore zero only while estimating brightness; preserve it as black.
+    nonzero_mask = valid_mask & (arr != 0)
+    values = arr[nonzero_mask]
+    if values.size == 0:
+        values = arr[valid_mask]
+
+    if values.size == 0:
+        limits = (0.0, 1.0)
+    else:
+        low, high = np.percentile(values, [2, 98])
+        if (not np.isfinite(low)) or (not np.isfinite(high)) or high <= low:
+            low = float(values.min())
+            high = float(values.max())
+        if (not np.isfinite(low)) or (not np.isfinite(high)) or high <= low:
+            limits = (0.0, 1.0)
+        else:
+            limits = (float(low), float(high))
+
+    auto_stretch_cache[cache_key] = limits
+    return limits
+
+
 def manual_or_auto_stretch(data, nodata=None, min_val=None, max_val=None):
     """Use manual stretch values when valid; otherwise use automatic brightening."""
     if min_val is None or max_val is None or max_val <= min_val:
@@ -147,6 +196,20 @@ def cached_jpeg_response(cache_key, image, cache_seconds=3600):
 
     return StreamingResponse(
         BytesIO(preview_cache[cache_key]),
+        media_type="image/jpeg",
+        headers={"Cache-Control": f"public, max-age={cache_seconds}"},
+    )
+
+
+def cached_fast_jpeg_response(cache_key, image, cache_seconds=3600):
+    """Return a smaller JPEG for fast full-extent overviews."""
+    fast_key = f"fast:{cache_key}"
+    if fast_key not in preview_cache:
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=72, optimize=True, progressive=True)
+        preview_cache[fast_key] = buffer.getvalue()
+    return StreamingResponse(
+        BytesIO(preview_cache[fast_key]),
         media_type="image/jpeg",
         headers={"Cache-Control": f"public, max-age={cache_seconds}"},
     )
@@ -189,6 +252,51 @@ async def upload_chunk(
 
     return {"status": "ok", "chunk_index": chunk_index}
 
+def prewarm_fast_overview(file_path: Path, cache_key_name: str, max_size: int = 480):
+    """Generate a tiny full-extent preview immediately from the assembled TIFF."""
+    cache_key = f"fast-overview:{cache_key_name}:{max_size}"
+    try:
+        with rasterio.open(file_path) as src:
+            data = read_preview_band(src, max_size=max_size)
+            display_data = brighten_preview(data, nodata=src.nodata)
+            image = Image.fromarray(display_data, mode="L").convert("RGB")
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=72, optimize=True, progressive=True)
+            preview_cache[cache_key] = buffer.getvalue()
+            return True
+    except Exception as exc:
+        print(f"Fast overview prewarm failed for {cache_key_name}: {exc}")
+        return False
+
+
+def convert_to_cog_background(final_path: Path, status_key: str):
+    """Convert a stable raw TIFF to COG in the background, then atomically replace it."""
+    cog_path = final_path.with_suffix('.cog.tif')
+    cog_status[status_key] = "converting"
+    try:
+        subprocess.run([
+            'gdal_translate',
+            str(final_path),
+            str(cog_path),
+            '-of', 'COG',
+            '-co', 'COMPRESS=DEFLATE',
+            '-co', 'BLOCKSIZE=512',
+            '-co', 'OVERVIEW_RESAMPLING=BILINEAR',
+            '-co', 'QUALITY=90',
+            '-co', 'BIGTIFF=IF_SAFER'
+        ], check=True, capture_output=True, text=True)
+        os.replace(cog_path, final_path)
+        cog_status[status_key] = "ready"
+    except subprocess.CalledProcessError as exc:
+        cog_status[status_key] = "raw"
+        cog_path.unlink(missing_ok=True)
+        print(f"Background COG conversion failed for {status_key}: {exc.stderr}")
+    except Exception as exc:
+        cog_status[status_key] = "raw"
+        cog_path.unlink(missing_ok=True)
+        print(f"Background COG conversion error for {status_key}: {exc}")
+
+
 @app.post("/api/upload-complete")
 def upload_complete(
     upload_id: str = Form(...),
@@ -196,82 +304,58 @@ def upload_complete(
     total_chunks: int = Form(...),
     container_name: str = Form(...),
 ):
-    """Combine chunks into one GeoTIFF file and convert to COG."""
+    """Assemble the TIFF, prewarm a fast overview, then convert to COG in background."""
     if upload_id not in upload_chunks:
         raise HTTPException(status_code=400, detail="Upload ID not found")
-
     if total_chunks <= 0:
         raise HTTPException(status_code=400, detail="Invalid chunk count")
 
     chunks = upload_chunks[upload_id]
-
     if len(chunks) != total_chunks:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Expected {total_chunks} chunks, got {len(chunks)}",
-        )
-
+        raise HTTPException(status_code=400, detail=f"Expected {total_chunks} chunks, got {len(chunks)}")
     if any(index not in chunks for index in range(total_chunks)):
         raise HTTPException(status_code=400, detail="Missing upload chunk")
 
     safe_filename = Path(filename).name
     safe_container_name = Path(container_name).name
-
     container_dir = STORAGE_DIR / safe_container_name
     container_dir.mkdir(exist_ok=True)
-
     final_path = container_dir / safe_filename
+    status_key = f"{safe_container_name}/{safe_filename}"
 
     try:
-        # Step 1: Assemble chunks
+        # Assemble once; after this point the raw GeoTIFF is complete and readable.
         with open(final_path, "wb") as final_file:
             for index in range(total_chunks):
                 chunk_path = chunks[index]
-
                 with open(chunk_path, "rb") as chunk_file:
                     while block := chunk_file.read(1024 * 1024):
                         final_file.write(block)
-
                 chunk_path.unlink(missing_ok=True)
 
-        # Step 2: Convert to COG format
-        cog_path = final_path.with_suffix('.cog.tif')
-        
-        try:
-            subprocess.run([
-                'gdal_translate',
-                str(final_path),
-                str(cog_path),
-                '-of', 'COG',
-                '-co', 'COMPRESS=DEFLATE',
-                '-co', 'BLOCKSIZE=512',
-                '-co', 'OVERVIEW_RESAMPLING=BILINEAR',
-                '-co', 'QUALITY=90',
-                '-co', 'BIGTIFF=IF_SAFER'
-            ], check=True, capture_output=True, text=True)
-            
-            final_path.unlink()
-            cog_path.rename(final_path)
-            
-        except subprocess.CalledProcessError as e:
-            cog_path.unlink(missing_ok=True)
-            print(f"COG conversion failed: {e.stderr}")
+        # Invalidate old previews, then prewarm a tiny overview NOW.
+        clear_preview_cache()
+        prewarm_fast_overview(final_path, status_key, max_size=480)
+        cog_status[status_key] = "raw"
+
+        # Do not make the user wait for GDAL COG conversion.
+        cog_executor.submit(convert_to_cog_background, final_path, status_key)
 
     except Exception:
         final_path.unlink(missing_ok=True)
         raise
-
     finally:
         upload_chunks.pop(upload_id, None)
 
-    clear_preview_cache()
-
     return {
         "status": "ok",
-        "file_path": f"{safe_container_name}/{safe_filename}",
+        "file_path": status_key,
         "filename": safe_filename,
         "container": safe_container_name,
+        "preview_ready": True,
+        "cog_status": "converting",
     }
+
 
 @app.delete("/api/files/{filename:path}")
 def delete_file(filename: str):
@@ -281,6 +365,12 @@ def delete_file(filename: str):
     clear_preview_cache()
 
     return {"status": "deleted", "filename": filename}
+
+@app.get("/api/cog-status")
+def get_cog_status(filename: str = Query(...)):
+    validate_file_exists(filename)
+    return {"filename": filename, "status": cog_status.get(filename, "ready")}
+
 
 @app.get("/api/metadata")
 def get_metadata(filename: str = Query(...)):
@@ -325,6 +415,163 @@ def get_thumbnail(filename: str = Query(...)):
             status_code=500,
             detail=f"Failed to generate thumbnail: {str(error)}",
         )
+
+@app.get("/api/fast-overview")
+def get_fast_overview(
+    filename: str = Query(...),
+    max_size: int = Query(480),
+):
+    """Return the prewarmed small full-extent overview for immediate display."""
+    validate_file_exists(filename)
+    max_size = max(128, min(int(max_size), 600))
+    cache_key = f"fast-overview:{filename}:{max_size}"
+
+    if cache_key in preview_cache:
+        return StreamingResponse(
+            BytesIO(preview_cache[cache_key]),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    # Fallback: generate it directly from the stable raw/COG file.
+    try:
+        file_path = validate_file_exists(filename)
+        ok = prewarm_fast_overview(file_path, filename, max_size=max_size)
+        if not ok:
+            raise RuntimeError("Fast overview generation failed")
+        return StreamingResponse(
+            BytesIO(preview_cache[cache_key]),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Failed to render fast overview: {error}")
+
+
+@app.get("/api/overview")
+def get_overview(
+    filename: str = Query(...),
+    min_val: Optional[float] = Query(None),
+    max_val: Optional[float] = Query(None),
+    max_size: int = Query(600),
+):
+    """Fast, full-extent overview used by both the viewport and minimap.
+
+    This is intentionally smaller than the normal image preview so it can
+    appear quickly after a raster is selected. It is not a native-resolution
+    image; OpenSeadragon loads native detail progressively through /api/tile.
+    """
+    file_path = validate_file_exists(filename)
+    max_size = max(128, min(int(max_size), 800))
+    cache_key = f"overview:{filename}:{min_val}:{max_val}:{max_size}"
+
+    try:
+        with rasterio.open(file_path) as src:
+            data = read_preview_band(src, max_size=max_size)
+
+            # IMPORTANT: do not calculate the expensive global stretch here.
+            # The overview must be fast enough to appear immediately for very
+            # large satellite rasters. Deep-zoom tiles use the global cached
+            # stretch separately, so the initial overview is only a temporary
+            # low-resolution display.
+            if min_val is None or max_val is None or max_val <= min_val:
+                display_data = brighten_preview(data, nodata=src.nodata)
+            else:
+                display_data = manual_or_auto_stretch(
+                    data,
+                    nodata=src.nodata,
+                    min_val=min_val,
+                    max_val=max_val,
+                )
+
+            image = Image.fromarray(display_data, mode="L").convert("RGB")
+            return cached_jpeg_response(cache_key, image, cache_seconds=3600)
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render raster overview: {str(error)}",
+        )
+
+
+@app.get("/api/rgb-overview")
+def get_rgb_overview(
+    r_file: str = Query(...),
+    g_file: str = Query(...),
+    b_file: str = Query(...),
+    r_min: Optional[float] = Query(None),
+    r_max: Optional[float] = Query(None),
+    g_min: Optional[float] = Query(None),
+    g_max: Optional[float] = Query(None),
+    b_min: Optional[float] = Query(None),
+    b_max: Optional[float] = Query(None),
+    max_size: int = Query(600),
+):
+    """Fast, full-extent RGB overview used before deep-zoom tiles arrive."""
+    r_path = validate_file_exists(r_file)
+    g_path = validate_file_exists(g_file)
+    b_path = validate_file_exists(b_file)
+    max_size = max(128, min(int(max_size), 800))
+
+    cache_key = (
+        f"rgb-overview:{r_file}:{g_file}:{b_file}:"
+        f"{r_min}:{r_max}:{g_min}:{g_max}:{b_min}:{b_max}:{max_size}"
+    )
+
+    try:
+        with (
+            rasterio.open(r_path) as r_src,
+            rasterio.open(g_path) as g_src,
+            rasterio.open(b_path) as b_src,
+        ):
+            out_width, out_height = preview_dimensions(r_src.width, r_src.height, max_size)
+
+            r_data = r_src.read(
+                1,
+                out_shape=(out_height, out_width),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+            g_data = g_src.read(
+                1,
+                out_shape=(out_height, out_width),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+            b_data = b_src.read(
+                1,
+                out_shape=(out_height, out_width),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+
+            # Keep RGB overview fast as well. Global stretch is reserved for
+            # the tiled renderer so the first full-extent image is available
+            # quickly even for multi-gigabyte satellite rasters.
+            if r_min is None or r_max is None or r_max <= r_min:
+                red = brighten_preview(r_data, nodata=r_src.nodata)
+            else:
+                red = manual_or_auto_stretch(r_data, r_src.nodata, r_min, r_max)
+
+            if g_min is None or g_max is None or g_max <= g_min:
+                green = brighten_preview(g_data, nodata=g_src.nodata)
+            else:
+                green = manual_or_auto_stretch(g_data, g_src.nodata, g_min, g_max)
+
+            if b_min is None or b_max is None or b_max <= b_min:
+                blue = brighten_preview(b_data, nodata=b_src.nodata)
+            else:
+                blue = manual_or_auto_stretch(b_data, b_src.nodata, b_min, b_max)
+
+            image = Image.fromarray(np.dstack((red, green, blue)), mode="RGB")
+            return cached_jpeg_response(cache_key, image, cache_seconds=3600)
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render RGB overview: {str(error)}",
+        )
+
 
 @app.get("/api/image")
 def get_image(
@@ -412,51 +659,169 @@ def get_tile(
     z: int = Query(...),
     x: int = Query(...),
     y: int = Query(...),
+    min_val: Optional[float] = Query(None),
+    max_val: Optional[float] = Query(None),
 ):
-    """Serve a 256x256 tile from the raster for the given zoom level."""
-    file_path = validate_file_exists(filename)   # ← resolves the real path in STORAGE_DIR
+    """Serve one OpenSeadragon-compatible 256x256 raster tile.
+
+    OpenSeadragon level 0 is the lowest-resolution overview and maxLevel is
+    native resolution. A tile at level z represents 256 source pixels scaled
+    by 2**(maxLevel-z). This keeps the server pyramid aligned with the viewer
+    so the complete raster behaves like a map: fit -> zoom -> pan -> load only
+    the newly visible detail.
+    """
+    file_path = validate_file_exists(filename)
 
     try:
         with rasterio.open(file_path) as src:
-            scale = 2 ** z
-            tile_w = src.width / scale
-            tile_h = src.height / scale
+            if z < 0 or x < 0 or y < 0:
+                raise HTTPException(status_code=400, detail="Invalid tile coordinates")
 
-            left = x * tile_w
-            top = y * tile_h
-            right = min(src.width, left + tile_w)
-            bottom = min(src.height, top + tile_h)
-
-            if left >= src.width or top >= src.height:
+            max_dim = max(src.width, src.height, 1)
+            max_level = max(0, int(math.ceil(math.log2(max(max_dim / TILE_SIZE, 1)))))
+            if z > max_level:
                 return Response(status_code=204)
 
-            window = Window.from_slices((top, bottom), (left, right))
-            data = src.read(1, window=window, masked=True)
+            source_scale = 2 ** (max_level - z)
+            tile_width = TILE_SIZE * source_scale
+            tile_height = TILE_SIZE * source_scale
 
-            # Normalize to 0-255 with 2-98 percentile stretch
-            arr = np.asarray(np.ma.filled(data, np.nan), dtype=np.float32)
-            valid = np.isfinite(arr)
-            if np.count_nonzero(valid) == 0:
-                img = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
+            left = x * tile_width
+            top = y * tile_height
+            right = min(src.width, left + tile_width)
+            bottom = min(src.height, top + tile_height)
+
+            if left >= src.width or top >= src.height or right <= left or bottom <= top:
+                return Response(status_code=204)
+
+            window = Window(
+                col_off=left,
+                row_off=top,
+                width=right - left,
+                height=bottom - top,
+            )
+
+            data = src.read(
+                1,
+                window=window,
+                out_shape=(TILE_SIZE, TILE_SIZE),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+
+            if min_val is None or max_val is None or max_val <= min_val:
+                low, high = get_global_stretch_limits(src, band=1)
+                display_data = manual_or_auto_stretch(
+                    data, src.nodata, low, high
+                )
             else:
-                lo, hi = np.nanpercentile(arr[valid], 2), np.nanpercentile(arr[valid], 98)
-                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                    lo, hi = float(np.nanmin(arr[valid])), float(np.nanmax(arr[valid]))
-                norm = np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+                display_data = manual_or_auto_stretch(
+                    data, src.nodata, min_val, max_val
+                )
 
-                img = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-                h = min(TILE_SIZE, norm.shape[0])
-                w = min(TILE_SIZE, norm.shape[1])
-                img[:h, :w] = norm[:h, :w]
+            output = BytesIO()
+            Image.fromarray(display_data, mode="L").save(
+                output, format="PNG", optimize=True
+            )
 
-        out = BytesIO()
-        Image.fromarray(img, mode="L").save(out, format="PNG")
-        return Response(content=out.getvalue(), media_type="image/png")
+            return Response(
+                content=output.getvalue(),
+                media_type="image/png",
+                headers={
+                    "Cache-Control": "public, max-age=3600, immutable"
+                },
+            )
 
+    except HTTPException:
+        raise
     except Exception as error:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to render tile: {str(error)}",
+        )
+
+@app.get("/api/rgb-tile")
+def get_rgb_tile(
+    r_file: str = Query(...),
+    g_file: str = Query(...),
+    b_file: str = Query(...),
+    z: int = Query(...),
+    x: int = Query(...),
+    y: int = Query(...),
+    r_min: Optional[float] = Query(None),
+    r_max: Optional[float] = Query(None),
+    g_min: Optional[float] = Query(None),
+    g_max: Optional[float] = Query(None),
+    b_min: Optional[float] = Query(None),
+    b_max: Optional[float] = Query(None),
+):
+    """Serve one OpenSeadragon-compatible RGB tile with stable per-band stretch."""
+    r_path = validate_file_exists(r_file)
+    g_path = validate_file_exists(g_file)
+    b_path = validate_file_exists(b_file)
+
+    try:
+        with rasterio.open(r_path) as r_src, rasterio.open(g_path) as g_src, rasterio.open(b_path) as b_src:
+            if z < 0 or x < 0 or y < 0:
+                raise HTTPException(status_code=400, detail="Invalid tile coordinates")
+
+            max_dim = max(r_src.width, r_src.height, 1)
+            max_level = max(0, int(math.ceil(math.log2(max(max_dim / TILE_SIZE, 1)))))
+            if z > max_level:
+                return Response(status_code=204)
+
+            source_scale = 2 ** (max_level - z)
+            tile_width = TILE_SIZE * source_scale
+            tile_height = TILE_SIZE * source_scale
+
+            left = x * tile_width
+            top = y * tile_height
+            right = min(r_src.width, left + tile_width)
+            bottom = min(r_src.height, top + tile_height)
+
+            if left >= r_src.width or top >= r_src.height or right <= left or bottom <= top:
+                return Response(status_code=204)
+
+            def read_channel(src):
+                window = Window(
+                    col_off=left,
+                    row_off=top,
+                    width=min(right, src.width) - left,
+                    height=min(bottom, src.height) - top,
+                )
+                return src.read(
+                    1,
+                    window=window,
+                    out_shape=(TILE_SIZE, TILE_SIZE),
+                    resampling=Resampling.bilinear,
+                    masked=True,
+                )
+
+            def stretch_channel(data, src, lo, hi):
+                if lo is None or hi is None or hi <= lo:
+                    lo, hi = get_global_stretch_limits(src, band=1)
+                return manual_or_auto_stretch(data, src.nodata, lo, hi)
+
+            red = stretch_channel(read_channel(r_src), r_src, r_min, r_max)
+            green = stretch_channel(read_channel(g_src), g_src, g_min, g_max)
+            blue = stretch_channel(read_channel(b_src), b_src, b_min, b_max)
+
+            rgb = np.dstack((red, green, blue))
+            output = BytesIO()
+            Image.fromarray(rgb, mode="RGB").save(output, format="PNG", optimize=True)
+
+            return Response(
+                content=output.getvalue(),
+                media_type="image/png",
+                headers={"Cache-Control": "public, max-age=3600, immutable"},
+            )
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to render RGB tile: {str(error)}"
         )
 
 @app.get("/api/rgb-composite")
