@@ -5,7 +5,7 @@ import OpenSeadragon from "openseadragon";
 const getApiUrl = () => {
   if (typeof window !== "undefined" && window.location.hostname.includes("github.dev")) {
     const hostname = window.location.hostname;
-const backendHostname = hostname.replace(/-\d+\.app\.github\.dev$/, "-8000.app.github.dev");
+    const backendHostname = hostname.replace(/-\d+\.app\.github\.dev$/, "-8000.app.github.dev");
     return `${window.location.protocol}//${backendHostname}/api`;
   }
   return "http://127.0.0.1:8000/api";
@@ -13,9 +13,6 @@ const backendHostname = hostname.replace(/-\d+\.app\.github\.dev$/, "-8000.app.g
 
 const API = getApiUrl();
 
-// Tile pyramid constants — must match the backend's TILE_SIZE / level
-// convention exactly (level 0 = whole image in ~1 tile, level == maxLevel
-// = full native resolution, doubling each level in between).
 const TILE_SIZE = 256;
 
 const computeMaxLevel = (width, height) => {
@@ -122,13 +119,11 @@ export default function ImageViewer() {
   const [histDefaultData, setHistDefaultData] = useState(null);
   const [histDefaultLoading, setHistDefaultLoading] = useState(false);
 
-
   const [histDropdownFile, setHistDropdownFile] = useState("");
   const [histActiveChannel, setHistActiveChannel] = useState(null);
   const [histSelectedRange, setHistSelectedRange] = useState(null);
   const [histSelectedChannel, setHistSelectedChannel] = useState(null);
   const [histBoxDrag, setHistBoxDrag] = useState(null);
-
 
   const [stretchValues, setStretchValues] = useState({
     default: { min: "", max: "" },
@@ -137,7 +132,6 @@ export default function ImageViewer() {
     b: { min: "", max: "" },
   });
 
-
   const [showScatterPlot, setShowScatterPlot] = useState(false);
   const [scatterXFile, setScatterXFile] = useState("");
   const [scatterXBand, setScatterXBand] = useState(1);
@@ -145,7 +139,6 @@ export default function ImageViewer() {
   const [scatterYBand, setScatterYBand] = useState(1);
   const [scatterData, setScatterData] = useState(null);
   const [isScatterLoading, setIsScatterLoading] = useState(false);
-
 
   const [isProfileMode, setIsProfileMode] = useState(false);
   const [profileStart, setProfileStart] = useState(null);
@@ -157,7 +150,6 @@ export default function ImageViewer() {
   const [profileFile, setProfileFile] = useState("");
   const [selectedProfileBand, setSelectedProfileBand] = useState(1);
 
-
   const [isSwipeMode, setIsSwipeMode] = useState(false);
   const [swipeLeftFile, setSwipeLeftFile] = useState("");
   const [swipeRightFile, setSwipeRightFile] = useState("");
@@ -166,29 +158,23 @@ export default function ImageViewer() {
   const [swipeLeftLoading, setSwipeLeftLoading] = useState(false);
   const [swipeRightLoading, setSwipeRightLoading] = useState(false);
 
-const [chunkImages, setChunkImages] = useState({});
-const [loadingChunks, setLoadingChunks] = useState([]);
+  const [chunkImages, setChunkImages] = useState({});
+  const [loadingChunks, setLoadingChunks] = useState([]);
   const [imageUrl, setImageUrl] = useState("");
   const [displayedImageUrl, setDisplayedImageUrl] = useState("");
   const [isImageLoading, setIsImageLoading] = useState(false);
-  // The low-resolution preview is shown in BOTH the viewport and minimap
-  // as soon as it arrives. OpenSeadragon loads its deep-zoom tiles in parallel
-  // and replaces the preview after the viewer is ready.
   const [showOverviewInViewport, setShowOverviewInViewport] = useState(false);
   const [osdReady, setOsdReady] = useState(false);
   const [viewMode, setViewMode] = useState("");
   const [toast, setToast] = useState(null);
-
 
   const [scale, setScale] = useState(1);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
-
   const [miniRect, setMiniRect] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const [showMinimap, setShowMinimap] = useState(true);
-
 
   const containerRef = useRef(null);
   const imgRef = useRef(null);
@@ -203,76 +189,106 @@ const [loadingChunks, setLoadingChunks] = useState([]);
   const stretchStateRef = useRef({});
   const imageHistoryRef = useRef({});
   const historyContextRef = useRef(null);
-const viewerRef = useRef(null);
-const osdContainerRef = useRef(null);
-const loadSequenceRef = useRef(0);
-const osdFirstTileRef = useRef(false);
-const lastViewedFileByContainerRef = useRef({});
-const viewerInteractionRef = useRef({ dragging: false, lastX: 0, lastY: 0, moved: false, suppressClick: false });
-const currentRasterSizeRef = useRef({ width: 1, height: 1 });
+  const viewerRef = useRef(null);
+  const osdContainerRef = useRef(null);
+  const loadSequenceRef = useRef(0);
+  const osdFirstTileRef = useRef(false);
+  const lastViewedFileByContainerRef = useRef({});
+  const viewerInteractionRef = useRef({ dragging: false, lastX: 0, lastY: 0, moved: false, suppressClick: false });
+  const currentRasterSizeRef = useRef({ width: 1, height: 1 });
+  const metadataCacheRef = useRef({});
+  const overviewBlobCacheRef = useRef({});
 
   const containerRgbRef = useRef({});
   const containerStretchRef = useRef({});
   const containerViewStateRef = useRef({});
 
-
   const userHasSetViewRef = useRef(false);
+const forceCleanViewerState = () => {
+  // 1. Abort any ongoing request
+  if (abortControllerRef.current) {
+    try { abortControllerRef.current.abort(); } catch (_) {}
+    abortControllerRef.current = null;
+  }
 
+  // 2. Destroy OpenSeadragon completely
+  if (viewerInteractionRef.current.cleanup) {
+    try { viewerInteractionRef.current.cleanup(); } catch (_) {}
+    viewerInteractionRef.current.cleanup = null;
+  }
+  if (viewerRef.current) {
+    try { viewerRef.current.destroy(); } catch (_) {}
+    viewerRef.current = null;
+  }
 
+  // 3. Clean object URLs
+  if (activeObjectUrlRef.current) {
+    try { URL.revokeObjectURL(activeObjectUrlRef.current); } catch (_) {}
+    activeObjectUrlRef.current = null;
+  }
+
+  // 4. Reset visual state
+  setDisplayedImageUrl("");
+  setShowOverviewInViewport(false);
+  setIsImageLoading(true);
+  setOsdReady(false);
+  osdFirstTileRef.current = false;
+  setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
+};
   const getHistoryKey = (containerName, filename) => {
     if (!containerName || !filename) return null;
     return `image:${containerName}:${filename}`;
   };
 
-
   const saveCurrentImageHistory = () => {
-    const context = historyContextRef.current;
-    if (!context?.key) return;
+  const context = historyContextRef.current;
+  if (!context?.key) return;
 
-    const record = {
-      containerName: context.containerName,
-      baseFile: context.baseFile,
-      selectedFile: selectedFile || null,
-      viewMode,
-      rFile,
-      gFile,
-      bFile,
-      stretchValues: cloneStretchValues(stretchValues),
-      histDropdownFile,
-      histActiveChannel,
-      histSelectedRange: histSelectedRange ? { ...histSelectedRange } : null,
-      histSelectedChannel,
-      showHistogram,
-      scale,
-      position: { ...position },
-      displayedImageUrl,
-    };
-
-    if (viewerRef.current?.viewport) {
-      try {
-        const viewport = viewerRef.current.viewport;
-        const center = viewport.getCenter();
-        const homeZoom = viewport.getHomeZoom();
-        record.osdZoom = viewport.getZoom();
-        record.osdCenter = { x: center.x, y: center.y };
-        record.osdHomeZoom = homeZoom;
-        record.scale = homeZoom > 0 ? viewport.getZoom() / homeZoom : scale;
-      } catch (error) {
-        // Viewer may be between destroy/open; keep the last React values.
-      }
-    }
-
-    imageHistoryRef.current[context.key] = record;
-    if (context.containerName && context.baseFile) {
-      lastViewedFileByContainerRef.current[context.containerName] = context.baseFile;
-    }
+  const record = {
+    containerName: context.containerName,
+    baseFile: context.baseFile,
+    selectedFile: selectedFile || null,
+    viewMode,
+    rFile,
+    gFile,
+    bFile,
+    stretchValues: cloneStretchValues(stretchValues),
+    histDropdownFile,
+    histActiveChannel,
+    histSelectedRange: histSelectedRange ? { ...histSelectedRange } : null,
+    histSelectedChannel,
+    showHistogram,
+    scale,
+    position: { ...position },
+    displayedImageUrl,
   };
+
+  // Capture the real OpenSeadragon viewport state
+  if (viewerRef.current?.viewport) {
+    try {
+      const viewport = viewerRef.current.viewport;
+      const center = viewport.getCenter();
+      const homeZoom = viewport.getHomeZoom();
+      record.osdZoom = viewport.getZoom();
+      record.osdCenter = { x: center.x, y: center.y };
+      record.osdHomeZoom = homeZoom;
+      record.scale = homeZoom > 0 ? viewport.getZoom() / homeZoom : scale;
+    } catch (error) {
+      // Viewer may be between destroy/open
+    }
+  }
+
+  imageHistoryRef.current[context.key] = record;
+
+  if (context.containerName && context.baseFile) {
+    lastViewedFileByContainerRef.current[context.containerName] = context.baseFile;
+  }
+};
 
   const getSavedImageHistory = (containerName, filename) => {
     const key = getHistoryKey(containerName, filename);
     return key ? imageHistoryRef.current[key] || null : null;
   };
-
 
   const setHistoryContext = (containerName, filename) => {
     const key = getHistoryKey(containerName, filename);
@@ -280,10 +296,8 @@ const currentRasterSizeRef = useRef({ width: 1, height: 1 });
     return key;
   };
 
-
   const rasterViewKey = (filename) => `raster:${filename}`;
   const compositeViewKey = (r, g, b) => `rgb:${r}:${g}:${b}`;
-
 
   const createEmptyStretchValues = () => ({
     default: { min: "", max: "" },
@@ -291,7 +305,6 @@ const currentRasterSizeRef = useRef({ width: 1, height: 1 });
     g: { min: "", max: "" },
     b: { min: "", max: "" },
   });
-
 
   const cloneStretchValues = useCallback((values) => {
     if (!values) return createEmptyStretchValues();
@@ -303,35 +316,29 @@ const currentRasterSizeRef = useRef({ width: 1, height: 1 });
     };
   }, []);
 
-
   const saveFileStretch = (filename, channel, min, max) => {
     if (!filename) return;
     const previousStretch = stretchStateRef.current[filename] || createEmptyStretchValues();
     stretchStateRef.current[filename] = { ...previousStretch, [channel]: { min, max } };
   };
 
-
   const getFileStretch = (filename) => {
     if (!filename) return createEmptyStretchValues();
     return cloneStretchValues(stretchStateRef.current[filename]);
   };
 
-
   const MIN_SCALE = 0.05;
   const MAX_SCALE = 50;
-
 
   const showToast = (message, type = "error") => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
   };
 
-
   const getDisplayFilename = (filePath) => {
     if (!filePath) return "";
     return filePath.replace(/\\/g, "/").split("/").pop();
   };
-
 
   const getDisplayName = useCallback(
     (storageKey) => {
@@ -341,7 +348,6 @@ const currentRasterSizeRef = useRef({ width: 1, height: 1 });
     [fileDisplayNames]
   );
 
-
   const getContainerForFile = (filename) => {
     for (const [containerName, files] of Object.entries(containers)) {
       if (files.includes(filename)) return containerName;
@@ -349,88 +355,86 @@ const currentRasterSizeRef = useRef({ width: 1, height: 1 });
     return null;
   };
 
-
   const activeFilesPool = useMemo(() => {
     if (activeContainer && containers[activeContainer]) return containers[activeContainer];
     return [];
   }, [activeContainer, containers]);
 
-
   const allFilesList = useMemo(() => Object.values(containers).flat(), [containers]);
 
-
   const getThumbnailUrl = useCallback((filePath) => {
-  if (!thumbnailCacheRef.current[filePath]) {
-    thumbnailCacheRef.current[filePath] = `${API}/thumbnail?filename=${encodeURIComponent(filePath)}`;
-  }
-  return thumbnailCacheRef.current[filePath];
-}, []);
+    if (!thumbnailCacheRef.current[filePath]) {
+      thumbnailCacheRef.current[filePath] = `${API}/thumbnail?filename=${encodeURIComponent(filePath)}`;
+    }
+    return thumbnailCacheRef.current[filePath];
+  }, []);
 
-// Builds (or rebuilds) the real OpenSeadragon deep-zoom viewport from a
-// resolved set of tile parameters. This is what actually makes the
-// viewport show tiles — the whole image renders from a handful of
-// low-res tiles almost immediately, and OSD automatically requests
-// higher-resolution tiles (via /api/tile or /api/rgb-tile) for whatever
-// region you zoom into, swapping them in as they arrive.
-const waitForRasterMetadata = async (filename, attempts = 14, delayMs = 500) => {
+  // ========== IMPROVED METADATA WAIT ==========
+  // ========== 1. Stronger metadata wait ==========
+const waitForRasterMetadata = async (filename, attempts = 10, delayMs = 300) => {
+  if (metadataCacheRef.current[filename]) {
+    return metadataCacheRef.current[filename];
+  }
+
   let lastError = null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const res = await axios.get(`${API}/metadata`, { params: { filename }, timeout: 4500 });
-      if (res?.data?.width && res?.data?.height) return res.data;
-      lastError = new Error("Metadata response did not contain raster dimensions.");
+      const res = await axios.get(`${API}/metadata`, {
+        params: { filename },
+        timeout: 3000,
+      });
+      if (res?.data?.width && res?.data?.height) {
+        metadataCacheRef.current[filename] = res.data;
+        return res.data;
+      }
+      lastError = new Error("No dimensions");
     } catch (error) {
       lastError = error;
     }
     if (attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await new Promise((r) => setTimeout(r, delayMs));
     }
   }
-  throw lastError || new Error("Raster metadata is not available yet.");
+  throw lastError || new Error("Metadata unavailable");
 };
 
-const buildOverviewUrl = (url) => {
-  const parsed = new URL(url);
-  const cacheBust = `_t=${Date.now()}`;
+  const buildOverviewUrl = (url) => {
+    const parsed = new URL(url);
 
-  if (parsed.pathname.endsWith("/rgb-composite")) {
+    if (parsed.pathname.endsWith("/rgb-composite")) {
+      const params = new URLSearchParams({
+        r_file: parsed.searchParams.get("r_file") || "",
+        g_file: parsed.searchParams.get("g_file") || "",
+        b_file: parsed.searchParams.get("b_file") || "",
+        max_size: "600",
+      });
+      ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
+        const value = parsed.searchParams.get(key);
+        if (value !== null && value !== "") params.set(key, value);
+      });
+      return `${API}/rgb-overview?${params.toString()}`;
+    }
+
+    const filename = parsed.searchParams.get("filename");
+    const minVal = parsed.searchParams.get("min_val");
+    const maxVal = parsed.searchParams.get("max_val");
     const params = new URLSearchParams({
-      r_file: parsed.searchParams.get("r_file") || "",
-      g_file: parsed.searchParams.get("g_file") || "",
-      b_file: parsed.searchParams.get("b_file") || "",
+      filename: filename || "",
       max_size: "600",
-      _t: String(Date.now()),
     });
-    ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
-      const value = parsed.searchParams.get(key);
-      if (value !== null && value !== "") params.set(key, value);
-    });
-    return `${API}/rgb-overview?${params.toString()}`;
-  }
-
-  const filename = parsed.searchParams.get("filename");
-  const minVal = parsed.searchParams.get("min_val");
-  const maxVal = parsed.searchParams.get("max_val");
-  const params = new URLSearchParams({
-    filename: filename || "",
-    max_size: "600",
-    _t: String(Date.now()),
-  });
-  if (minVal !== null && minVal !== "") params.set("min_val", minVal);
-  if (maxVal !== null && maxVal !== "") params.set("max_val", maxVal);
-  return `${API}/overview?${params.toString()}`;
-};
+    if (minVal !== null && minVal !== "") params.set("min_val", minVal);
+    if (maxVal !== null && maxVal !== "") params.set("max_val", maxVal);
+    return `${API}/overview?${params.toString()}`;
+  };
 
 const buildFastPreviewUrl = (url) => {
   const parsed = new URL(url);
-  const stamp = Date.now();
   if (parsed.pathname.endsWith("/rgb-composite")) {
     const params = new URLSearchParams({
       r_file: parsed.searchParams.get("r_file") || "",
       g_file: parsed.searchParams.get("g_file") || "",
       b_file: parsed.searchParams.get("b_file") || "",
-      max_size: "320",
-      _t: String(stamp),
+      max_size: "280",
     });
     ["r_min","r_max","g_min","g_max","b_min","b_max"].forEach((key) => {
       const value = parsed.searchParams.get(key);
@@ -440,13 +444,15 @@ const buildFastPreviewUrl = (url) => {
   }
   const filename = parsed.searchParams.get("filename");
   if (!filename || !parsed.pathname.endsWith("/image")) return null;
-  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&max_size=480&_t=${stamp}`;
+  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&max_size=300`;
 };
 
+  // ========== IMPROVED OVERVIEW LOADER (never hangs > 10s) ==========
+  // ========== 2. Much more reliable overview loader ==========
 const loadVerifiedOverview = async (url, requestId) => {
   const overviewUrl = buildOverviewUrl(url);
   const fastPreviewUrl = buildFastPreviewUrl(url);
-  const deadline = Date.now() + 9500;
+  const deadline = Date.now() + 9000; // hard limit < 10 s
   let lastError = null;
   let hasPublishedOverview = false;
 
@@ -467,409 +473,382 @@ const loadVerifiedOverview = async (url, requestId) => {
   };
 
   const tryFetchImage = async (imageUrl, timeoutMs) => {
+    // Always check cache first
+    const cachedBlob = overviewBlobCacheRef.current[imageUrl];
+    if (cachedBlob) {
+      return URL.createObjectURL(cachedBlob);
+    }
+
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(imageUrl, {
-        cache: "no-store",
         signal: controller.signal,
+        cache: "force-cache", // help browser cache
       });
-      if (!response.ok) throw new Error(`Overview request failed: ${response.status}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
-      if (!blob || blob.size === 0) throw new Error("Overview response was empty.");
+      if (!blob || blob.size === 0) throw new Error("Empty response");
+      overviewBlobCacheRef.current[imageUrl] = blob;
       return URL.createObjectURL(blob);
     } finally {
       window.clearTimeout(timeout);
     }
   };
 
-  while (Date.now() < deadline && requestId === loadSequenceRef.current) {
-    const remaining = Math.max(500, deadline - Date.now());
-
-    // Fast path: publish a compact full-extent preview as soon as possible.
-    // It is used simultaneously by the viewport and minimap.
-    if (!hasPublishedOverview && fastPreviewUrl) {
-      try {
-        const objectUrl = await tryFetchImage(fastPreviewUrl, Math.min(1200, remaining));
-        if (!publishObjectUrl(objectUrl)) return false;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
+   // ---- Priority 1: Fast overview (must succeed under 2 s) ----
+  if (fastPreviewUrl && requestId === loadSequenceRef.current) {
+  for (let i = 0; i < 4; i++) {                 // more retries
     if (requestId !== loadSequenceRef.current) return false;
-
-    // Once a low-res overview exists, try to replace it with the larger 600px
-    // full-extent overview. This does not block initial display.
-    if (remaining > 700) {
-      try {
-        const objectUrl = await tryFetchImage(overviewUrl, Math.min(2200, remaining));
-        if (publishObjectUrl(objectUrl)) return true;
-      } catch (error) {
-        lastError = error;
-      }
+    try {
+      // Give large files up to 3 seconds for first paint
+      const objectUrl = await tryFetchImage(fastPreviewUrl, 3000);
+      if (publishObjectUrl(objectUrl)) break;
+    } catch (err) {
+      lastError = err;
+      await new Promise((r) => setTimeout(r, 300));
     }
-
+  }
+}
+  // ---- Priority 2: Better overview (only if we still have time) ----
+  while (Date.now() < deadline && requestId === loadSequenceRef.current) {
     if (hasPublishedOverview) {
-      // Keep the currently visible full-extent overview and let the deep-zoom
-      // viewer continue independently. There is no reason to hide it because
-      // the higher quality overview missed a retry window.
+      // We already have something on screen – good enough
       setIsImageLoading(false);
+      return true;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    const remaining = Math.max(400, deadline - Date.now());
+    try {
+      const objectUrl = await tryFetchImage(overviewUrl, Math.min(2000, remaining));
+      if (publishObjectUrl(objectUrl)) return true;
+    } catch (err) {
+      lastError = err;
+    }
+
+    await new Promise((r) => setTimeout(r, 200));
   }
 
-  if (requestId === loadSequenceRef.current && hasPublishedOverview) {
+  // Final safety net
+  if (requestId === loadSequenceRef.current) {
     setIsImageLoading(false);
-    return true;
+    if (!hasPublishedOverview) {
+      console.warn("Overview timed out:", lastError);
+      showToast("Image took too long. Click the file again.", "error");
+    }
   }
-
-  console.warn("Raster overview could not be loaded within 10 seconds:", lastError);
-  return false;
+  return hasPublishedOverview;
 };
 
-const updateMiniRectFromViewer = (width, height, viewer = viewerRef.current) => {
-  if (!viewer?.viewport || !width || !height) return;
-  try {
-    // Convert the ACTUAL viewport bounds directly into raster/image pixels.
-    // The minimap is display-only; it simply mirrors this rectangle.
-    const viewportBounds = viewer.viewport.getBounds(true);
-    const imageBounds = viewer.viewport.viewportToImageRectangle(viewportBounds);
+  const updateMiniRectFromViewer = (width, height, viewer = viewerRef.current) => {
+    if (!viewer?.viewport || !width || !height) return;
+    try {
+      const viewportBounds = viewer.viewport.getBounds(true);
+      const imageBounds = viewer.viewport.viewportToImageRectangle(viewportBounds);
 
-    const left = Math.max(0, Math.min(1, imageBounds.x / width));
-    const top = Math.max(0, Math.min(1, imageBounds.y / height));
-    const right = Math.max(left, Math.min(1, (imageBounds.x + imageBounds.width) / width));
-    const bottom = Math.max(top, Math.min(1, (imageBounds.y + imageBounds.height) / height));
+      const left = Math.max(0, Math.min(1, imageBounds.x / width));
+      const top = Math.max(0, Math.min(1, imageBounds.y / height));
+      const right = Math.max(left, Math.min(1, (imageBounds.x + imageBounds.width) / width));
+      const bottom = Math.max(top, Math.min(1, (imageBounds.y + imageBounds.height) / height));
 
-    setMiniRect({
-      left,
-      top,
-      width: Math.max(0, Math.min(1, right - left)),
-      height: Math.max(0, Math.min(1, bottom - top)),
-    });
-  } catch (error) {
-    // Ignore transient viewer lifecycle changes.
-  }
-};
+      setMiniRect({
+        left,
+        top,
+        width: Math.max(0, Math.min(1, right - left)),
+        height: Math.max(0, Math.min(1, bottom - top)),
+      });
+    } catch (error) {}
+  };
 
-const buildAndShowTiles = async (tileParams, requestId, restoreViewport = null) => {
-  if (viewerInteractionRef.current.cleanup) {
-    viewerInteractionRef.current.cleanup();
-    viewerInteractionRef.current.cleanup = null;
-  }
-  if (viewerRef.current) {
-    viewerRef.current.destroy();
-    viewerRef.current = null;
-  }
-  if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
-
-  const metaFile = tileParams.type === "rgb" ? tileParams.r : tileParams.file;
-  if (!metaFile) return;
-
-  setIsImageLoading(true);
-  setOsdReady(false);
-  osdFirstTileRef.current = false;
-
-  try {
-    const metadata = await waitForRasterMetadata(metaFile);
-    const { width, height } = metadata;
-    currentRasterSizeRef.current = { width, height };
+  const buildAndShowTiles = async (tileParams, requestId, restoreViewport = null) => {
+    if (viewerInteractionRef.current.cleanup) {
+      viewerInteractionRef.current.cleanup();
+      viewerInteractionRef.current.cleanup = null;
+    }
+    if (viewerRef.current) {
+      viewerRef.current.destroy();
+      viewerRef.current = null;
+    }
     if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
-    const maxLevel = computeMaxLevel(width, height);
+    const metaFile = tileParams.type === "rgb" ? tileParams.r : tileParams.file;
+    if (!metaFile) return;
 
-    const buildRasterTileUrl = (level, x, y) => {
-      let tileUrl = `${API}/tile?filename=${encodeURIComponent(tileParams.file)}&z=${level}&x=${x}&y=${y}`;
-      if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
-      if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
-      return tileUrl;
-    };
+    setIsImageLoading(true);
+    setOsdReady(false);
+    osdFirstTileRef.current = false;
 
-    const buildRgbTileUrl = (level, x, y) => {
-      let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
-      [["r_min", tileParams.rMin], ["r_max", tileParams.rMax], ["g_min", tileParams.gMin], ["g_max", tileParams.gMax], ["b_min", tileParams.bMin], ["b_max", tileParams.bMax]].forEach(([key, val]) => {
-        if (val !== "" && val != null) tileUrl += `&${key}=${encodeURIComponent(val)}`;
-      });
-      return tileUrl;
-    };
+    try {
+      const metadata = await waitForRasterMetadata(metaFile);
+      const { width, height } = metadata;
+      currentRasterSizeRef.current = { width, height };
+      if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
-    const tileSource = {
-      width,
-      height,
-      tileSize: TILE_SIZE,
-      tileOverlap: 0,
-      minLevel: 0,
-      maxLevel,
-      getTileUrl: tileParams.type === "rgb" ? buildRgbTileUrl : buildRasterTileUrl,
-    };
+      const maxLevel = computeMaxLevel(width, height);
 
-    viewerRef.current = OpenSeadragon({
-      id: osdContainerRef.current.id,
-      prefixUrl: "",
-      crossOriginPolicy: "Anonymous",
-      useCanvas: true,
-      tileSources: tileSource,
-      showNavigationControl: false,
-      // Use explicit pointer handlers below. Keeping OSD mouse navigation off
-      // avoids competing event handlers while still controlling the REAL image
-      // viewport directly through viewport.zoomBy()/panBy().
-      gestureSettingsMouse: {
-        clickToZoom: false,
-        dblClickToZoom: false,
-        dragToPan: false,
-        scrollToZoom: false,
-      },
-      homeFillsViewer: false,
-      visibilityRatio: 1,
-      constrainDuringPan: true,
-      minZoomImageRatio: 1,
-      maxZoomPixelRatio: 4,
-      zoomPerScroll: 1.2,
-      animationTime: 0.8,
-      mouseNavEnabled: false,
-      immediateRender: true,
-      imageLoaderLimit: 6,
-      maxImageCacheCount: 256,
-      smoothTileEdgesMinZoom: 1.0,
-    });
-
-    // The main viewport is the ONLY source of zoom/pan truth.
-    // The minimap is display-only and is updated from viewport changes.
-    const surface = osdContainerRef.current;
-    const viewer = viewerRef.current;
-    if (surface && viewer) {
-      surface.style.cursor = "grab";
-      surface.style.touchAction = "none";
-      surface.style.userSelect = "none";
-
-      const interaction = viewerInteractionRef.current;
-      const onWheel = (event) => {
-        if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
-        event.preventDefault();
-        event.stopPropagation();
-
-        const rect = surface.getBoundingClientRect();
-        const pixel = new OpenSeadragon.Point(
-          event.clientX - rect.left,
-          event.clientY - rect.top
-        );
-        const refPoint = viewer.viewport.pointFromPixel(pixel, true);
-        const factor = event.deltaY < 0 ? 1.25 : 0.8;
-
-        viewer.viewport.zoomBy(factor, refPoint, true);
-        viewer.viewport.applyConstraints();
-        userHasSetViewRef.current = true;
-        updateMiniRectFromViewer(width, height, viewer);
-        saveCurrentImageHistory();
+      const buildRasterTileUrl = (level, x, y) => {
+        let tileUrl = `${API}/tile?filename=${encodeURIComponent(tileParams.file)}&z=${level}&x=${x}&y=${y}`;
+        if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
+        if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
+        return tileUrl;
       };
 
-      const onPointerDown = (event) => {
-        if (requestId !== loadSequenceRef.current || event.button !== 0 || !viewer.viewport) return;
-
-        interaction.dragging = true;
-        interaction.moved = false;
-        interaction.lastX = event.clientX;
-        interaction.lastY = event.clientY;
-        surface.style.cursor = "grabbing";
-
-        try {
-          surface.setPointerCapture(event.pointerId);
-        } catch (_) {}
-
-        event.preventDefault();
-        event.stopPropagation();
-      };
-
-      const onPointerMove = (event) => {
-        if (!interaction.dragging || requestId !== loadSequenceRef.current || !viewer.viewport) return;
-
-        const dx = event.clientX - interaction.lastX;
-        const dy = event.clientY - interaction.lastY;
-        if (Math.abs(dx) + Math.abs(dy) > 1) interaction.moved = true;
-
-        interaction.lastX = event.clientX;
-        interaction.lastY = event.clientY;
-
-        const delta = viewer.viewport.deltaPointsFromPixels(
-          new OpenSeadragon.Point(dx, dy),
-          true
-        );
-        viewer.viewport.panBy(delta.times(-1), true);
-        viewer.viewport.applyConstraints();
-        userHasSetViewRef.current = true;
-        updateMiniRectFromViewer(width, height, viewer);
-
-        event.preventDefault();
-        event.stopPropagation();
-      };
-
-      const finishPointer = (event) => {
-        if (!interaction.dragging) return;
-        interaction.dragging = false;
-        surface.style.cursor = "grab";
-        try {
-          surface.releasePointerCapture(event.pointerId);
-        } catch (_) {}
-        saveCurrentImageHistory();
-        event.preventDefault();
-        event.stopPropagation();
-      };
-
-      const onDoubleClick = (event) => {
-        if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
-
-        const rect = surface.getBoundingClientRect();
-        const pixel = new OpenSeadragon.Point(
-          event.clientX - rect.left,
-          event.clientY - rect.top
-        );
-        const refPoint = viewer.viewport.pointFromPixel(pixel, true);
-
-        viewer.viewport.zoomBy(2, refPoint, true);
-        viewer.viewport.applyConstraints();
-        userHasSetViewRef.current = true;
-        updateMiniRectFromViewer(width, height, viewer);
-        saveCurrentImageHistory();
-        event.preventDefault();
-        event.stopPropagation();
-      };
-
-      surface.addEventListener("wheel", onWheel, { passive: false });
-      surface.addEventListener("pointerdown", onPointerDown);
-      surface.addEventListener("pointermove", onPointerMove);
-      surface.addEventListener("pointerup", finishPointer);
-      surface.addEventListener("pointercancel", finishPointer);
-      surface.addEventListener("dblclick", onDoubleClick);
-
-      viewerInteractionRef.current.cleanup = () => {
-        surface.removeEventListener("wheel", onWheel);
-        surface.removeEventListener("pointerdown", onPointerDown);
-        surface.removeEventListener("pointermove", onPointerMove);
-        surface.removeEventListener("pointerup", finishPointer);
-        surface.removeEventListener("pointercancel", finishPointer);
-        surface.removeEventListener("dblclick", onDoubleClick);
-        surface.style.cursor = "default";
-        surface.style.touchAction = "";
-        surface.style.userSelect = "";
-      };
-    }
-
-    viewerRef.current.addOnceHandler("open", () => {
-      if (requestId !== loadSequenceRef.current) return;
-      setOsdReady(true);
-      const viewer = viewerRef.current;
-      if (viewer) {
-        viewer.viewport.goHome(true);
-        viewer.viewport.applyConstraints();
-
-        const restore = restoreViewport && Number.isFinite(restoreViewport.osdZoom) && restoreViewport.osdCenter
-          ? restoreViewport
-          : null;
-
-        requestAnimationFrame(() => {
-          if (!viewerRef.current || requestId !== loadSequenceRef.current) return;
-          const currentViewer = viewerRef.current;
-          currentViewer.viewport.goHome(true);
-          currentViewer.viewport.applyConstraints();
-          if (restore) {
-            currentViewer.viewport.zoomTo(restore.osdZoom, null, true);
-            currentViewer.viewport.panTo(
-              new OpenSeadragon.Point(restore.osdCenter.x, restore.osdCenter.y),
-              true
-            );
-            currentViewer.viewport.applyConstraints();
-          }
-          updateMiniRectFromViewer(width, height, currentViewer);
+      const buildRgbTileUrl = (level, x, y) => {
+        let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
+        [["r_min", tileParams.rMin], ["r_max", tileParams.rMax], ["g_min", tileParams.gMin], ["g_max", tileParams.gMax], ["b_min", tileParams.bMin], ["b_max", tileParams.bMax]].forEach(([key, val]) => {
+          if (val !== "" && val != null) tileUrl += `&${key}=${encodeURIComponent(val)}`;
         });
-      }
-    });
+        return tileUrl;
+      };
 
-    viewerRef.current.addHandler("viewport-change", () => {
-      if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
+      const tileSource = {
+        width,
+        height,
+        tileSize: TILE_SIZE,
+        tileOverlap: 0,
+        minLevel: 0,
+        maxLevel,
+        getTileUrl: tileParams.type === "rgb" ? buildRgbTileUrl : buildRasterTileUrl,
+      };
+
+      viewerRef.current = OpenSeadragon({
+        id: osdContainerRef.current.id,
+        prefixUrl: "",
+        crossOriginPolicy: "Anonymous",
+        useCanvas: true,
+        tileSources: tileSource,
+        showNavigationControl: false,
+        gestureSettingsMouse: {
+          clickToZoom: false,
+          dblClickToZoom: false,
+          dragToPan: false,
+          scrollToZoom: false,
+        },
+        homeFillsViewer: false,
+        visibilityRatio: 1,
+        constrainDuringPan: true,
+        minZoomImageRatio: 1,
+        maxZoomPixelRatio: 4,
+        zoomPerScroll: 1.2,
+        animationTime: 0.8,
+        mouseNavEnabled: false,
+        immediateRender: true,
+        imageLoaderLimit: 6,
+        maxImageCacheCount: 256,
+        smoothTileEdgesMinZoom: 1.0,
+      });
+
+      const surface = osdContainerRef.current;
       const viewer = viewerRef.current;
-      const homeZoom = viewer.viewport.getHomeZoom();
-      const zoom = viewer.viewport.getZoom();
-      setScale(homeZoom > 0 ? zoom / homeZoom : 1);
-      updateMiniRectFromViewer(width, height, viewer);
-      saveCurrentImageHistory();
-    });
+      if (surface && viewer) {
+        surface.style.cursor = "grab";
+        surface.style.touchAction = "none";
+        surface.style.userSelect = "none";
 
+        const interaction = viewerInteractionRef.current;
+        const onWheel = (event) => {
+          if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
+          event.preventDefault();
+          event.stopPropagation();
 
-    viewerRef.current.addHandler("animation-finish", () => {
-      if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
-      updateMiniRectFromViewer(width, height, viewerRef.current);
-      saveCurrentImageHistory();
-    });
+          const rect = surface.getBoundingClientRect();
+          const pixel = new OpenSeadragon.Point(
+            event.clientX - rect.left,
+            event.clientY - rect.top
+          );
+          const refPoint = viewer.viewport.pointFromPixel(pixel, true);
+          const factor = event.deltaY < 0 ? 1.25 : 0.8;
 
-    viewerRef.current.addOnceHandler("tile-drawn", () => {
-      if (requestId !== loadSequenceRef.current) return;
-      osdFirstTileRef.current = true;
-      setShowOverviewInViewport(false);
-    });
+          viewer.viewport.zoomBy(factor, refPoint, true);
+          viewer.viewport.applyConstraints();
+          userHasSetViewRef.current = true;
+          updateMiniRectFromViewer(width, height, viewer);
+          saveCurrentImageHistory();
+        };
 
-    viewerRef.current.addHandler("resize", () => {
-      const viewer = viewerRef.current;
-      if (!viewer || requestId !== loadSequenceRef.current) return;
-      if (viewer.viewport.getZoom() <= viewer.viewport.getHomeZoom() * 1.01) {
-        viewer.viewport.goHome(true);
+        const onPointerDown = (event) => {
+          if (requestId !== loadSequenceRef.current || event.button !== 0 || !viewer.viewport) return;
+
+          interaction.dragging = true;
+          interaction.moved = false;
+          interaction.lastX = event.clientX;
+          interaction.lastY = event.clientY;
+          surface.style.cursor = "grabbing";
+
+          try {
+            surface.setPointerCapture(event.pointerId);
+          } catch (_) {}
+
+          event.preventDefault();
+          event.stopPropagation();
+        };
+
+        const onPointerMove = (event) => {
+          if (!interaction.dragging || requestId !== loadSequenceRef.current || !viewer.viewport) return;
+
+          const dx = event.clientX - interaction.lastX;
+          const dy = event.clientY - interaction.lastY;
+          if (Math.abs(dx) + Math.abs(dy) > 1) interaction.moved = true;
+
+          interaction.lastX = event.clientX;
+          interaction.lastY = event.clientY;
+
+          const delta = viewer.viewport.deltaPointsFromPixels(
+            new OpenSeadragon.Point(dx, dy),
+            true
+          );
+          viewer.viewport.panBy(delta.times(-1), true);
+          viewer.viewport.applyConstraints();
+          userHasSetViewRef.current = true;
+          updateMiniRectFromViewer(width, height, viewer);
+
+          event.preventDefault();
+          event.stopPropagation();
+        };
+
+        const finishPointer = (event) => {
+          if (!interaction.dragging) return;
+          interaction.dragging = false;
+          surface.style.cursor = "grab";
+          try {
+            surface.releasePointerCapture(event.pointerId);
+          } catch (_) {}
+          saveCurrentImageHistory();
+          event.preventDefault();
+          event.stopPropagation();
+        };
+
+        const onDoubleClick = (event) => {
+          if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
+
+          const rect = surface.getBoundingClientRect();
+          const pixel = new OpenSeadragon.Point(
+            event.clientX - rect.left,
+            event.clientY - rect.top
+          );
+          const refPoint = viewer.viewport.pointFromPixel(pixel, true);
+
+          viewer.viewport.zoomBy(2, refPoint, true);
+          viewer.viewport.applyConstraints();
+          userHasSetViewRef.current = true;
+          updateMiniRectFromViewer(width, height, viewer);
+          saveCurrentImageHistory();
+          event.preventDefault();
+          event.stopPropagation();
+        };
+
+        surface.addEventListener("wheel", onWheel, { passive: false });
+        surface.addEventListener("pointerdown", onPointerDown);
+        surface.addEventListener("pointermove", onPointerMove);
+        surface.addEventListener("pointerup", finishPointer);
+        surface.addEventListener("pointercancel", finishPointer);
+        surface.addEventListener("dblclick", onDoubleClick);
+
+        viewerInteractionRef.current.cleanup = () => {
+          surface.removeEventListener("wheel", onWheel);
+          surface.removeEventListener("pointerdown", onPointerDown);
+          surface.removeEventListener("pointermove", onPointerMove);
+          surface.removeEventListener("pointerup", finishPointer);
+          surface.removeEventListener("pointercancel", finishPointer);
+          surface.removeEventListener("dblclick", onDoubleClick);
+          surface.style.cursor = "default";
+          surface.style.touchAction = "";
+          surface.style.userSelect = "";
+        };
       }
-    });
 
-    viewerRef.current.addOnceHandler("open-failed", () => {
-      if (requestId !== loadSequenceRef.current) return;
-      setOsdReady(false);
-      // Keep the overview visible. A tiled viewer failure should not blank the map.
-    });
-  } catch (error) {
-    console.error("Failed to initialize tiled viewer:", error);
-    if (requestId === loadSequenceRef.current) setOsdReady(false);
-  }
-};
+      viewerRef.current.addOnceHandler("open", () => {
+        if (requestId !== loadSequenceRef.current) return;
+        setOsdReady(true);
+        const viewer = viewerRef.current;
+        if (viewer) {
+          viewer.viewport.goHome(true);
+          viewer.viewport.applyConstraints();
 
+          const restore = restoreViewport && Number.isFinite(restoreViewport.osdZoom) && restoreViewport.osdCenter
+            ? restoreViewport
+            : null;
+
+          requestAnimationFrame(() => {
+            if (!viewerRef.current || requestId !== loadSequenceRef.current) return;
+            const currentViewer = viewerRef.current;
+            currentViewer.viewport.goHome(true);
+            currentViewer.viewport.applyConstraints();
+            if (restore) {
+              currentViewer.viewport.zoomTo(restore.osdZoom, null, true);
+              currentViewer.viewport.panTo(
+                new OpenSeadragon.Point(restore.osdCenter.x, restore.osdCenter.y),
+                true
+              );
+              currentViewer.viewport.applyConstraints();
+            }
+            updateMiniRectFromViewer(width, height, currentViewer);
+          });
+        }
+      });
+
+      viewerRef.current.addHandler("viewport-change", () => {
+        if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
+        const viewer = viewerRef.current;
+        const homeZoom = viewer.viewport.getHomeZoom();
+        const zoom = viewer.viewport.getZoom();
+        setScale(homeZoom > 0 ? zoom / homeZoom : 1);
+        updateMiniRectFromViewer(width, height, viewer);
+        saveCurrentImageHistory();
+      });
+
+      viewerRef.current.addHandler("animation-finish", () => {
+        if (requestId !== loadSequenceRef.current || !viewerRef.current) return;
+        updateMiniRectFromViewer(width, height, viewerRef.current);
+        saveCurrentImageHistory();
+      });
+
+      viewerRef.current.addOnceHandler("tile-drawn", () => {
+        if (requestId !== loadSequenceRef.current) return;
+        osdFirstTileRef.current = true;
+        setShowOverviewInViewport(false);
+      });
+
+      viewerRef.current.addHandler("resize", () => {
+        const viewer = viewerRef.current;
+        if (!viewer || requestId !== loadSequenceRef.current) return;
+        if (viewer.viewport.getZoom() <= viewer.viewport.getHomeZoom() * 1.01) {
+          viewer.viewport.goHome(true);
+        }
+      });
+
+      viewerRef.current.addOnceHandler("open-failed", () => {
+        if (requestId !== loadSequenceRef.current) return;
+        setOsdReady(false);
+      });
+    } catch (error) {
+      console.error("Failed to initialize tiled viewer:", error);
+      if (requestId === loadSequenceRef.current) setOsdReady(false);
+    }
+  };
+
+  // ========== IMPROVED loadImage ==========
 const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = null) => {
-  const requestId = loadSequenceRef.current + 1;
-  loadSequenceRef.current = requestId;
+  // Clean everything first
+  forceCleanViewerState();
 
-  if (abortControllerRef.current) abortControllerRef.current.abort();
-  if (viewerInteractionRef.current.cleanup) {
-    viewerInteractionRef.current.cleanup();
-    viewerInteractionRef.current.cleanup = null;
-  }
-  if (viewerRef.current) {
-    viewerRef.current.destroy();
-    viewerRef.current = null;
-  }
-  if (activeObjectUrlRef.current) {
-    URL.revokeObjectURL(activeObjectUrlRef.current);
-    activeObjectUrlRef.current = null;
-  }
-
+  const requestId = ++loadSequenceRef.current;
   abortControllerRef.current = new AbortController();
+
   setImageUrl(url);
   userHasSetViewRef.current = Boolean(restoreViewport);
-  setOsdReady(false);
-  osdFirstTileRef.current = false;
-  // Immediately detach the previous raster so another container can never
-  // leave its old minimap/overview visible while the new raster loads.
-  setDisplayedImageUrl("");
-  setShowOverviewInViewport(false);
-  setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
-  setIsImageLoading(true);
   currentViewKeyRef.current = viewKey;
 
   let parsed;
   try {
     parsed = new URL(url);
   } catch (error) {
-    console.error("Invalid image URL:", error);
     setIsImageLoading(false);
+    showToast("Invalid image URL", "error");
     return;
   }
 
-  // Start both operations at the same time:
-  // 1) a fast, full-extent low-resolution overview for viewport + minimap
-  // 2) OpenSeadragon metadata/tile initialization for map-style zoom and pan
+  // Start tiles
   if (parsed.pathname.endsWith("/rgb-composite")) {
     buildAndShowTiles({
       type: "rgb",
@@ -892,17 +871,14 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }, requestId, restoreViewport);
   }
 
+  // Start overview
   loadVerifiedOverview(url, requestId).then((loaded) => {
-    if (!loaded && requestId === loadSequenceRef.current) {
-      // Keep the loading state visible instead of showing a broken image.
-      setIsImageLoading(true);
+    if (requestId === loadSequenceRef.current && !loaded) {
+      setIsImageLoading(false);
     }
   });
 };
 
-  // Tear down the OSD viewer whenever swipe mode is entered — its
-  // container div gets unmounted while in swipe mode, so the viewer
-  // instance must not be left pointing at a detached element.
   useEffect(() => {
     if (isSwipeMode && viewerRef.current) {
       viewerRef.current.destroy();
@@ -922,7 +898,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     };
   }, [scale, position, rFile, gFile, bFile, stretchValues, activeContainer]);
 
-
   useEffect(() => {
     saveCurrentImageHistory();
   }, [
@@ -930,7 +905,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     histDropdownFile, histActiveChannel, histSelectedRange,
     histSelectedChannel, showHistogram, scale, position, displayedImageUrl,
   ]);
-
 
   useEffect(() => {
     const updateMini = () => {
@@ -945,14 +919,12 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return () => window.removeEventListener("resize", updateMini);
   }, [displayedImageUrl, rasterInfo?.width, rasterInfo?.height, isSwipeMode]);
 
-
   const buildSingleImageUrl = (filename, stretch) => {
     let url = `${API}/image?filename=${encodeURIComponent(filename)}`;
     if (stretch && stretch.min !== "" && stretch.min != null) url += `&min_val=${encodeURIComponent(stretch.min)}`;
     if (stretch && stretch.max !== "" && stretch.max != null) url += `&max_val=${encodeURIComponent(stretch.max)}`;
     return url;
   };
-
 
   const buildCompositeUrl = (r, g, b, stretch) => {
     let url = `${API}/rgb-composite?r_file=${encodeURIComponent(r)}&g_file=${encodeURIComponent(g)}&b_file=${encodeURIComponent(b)}`;
@@ -963,7 +935,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     });
     return url;
   };
-
 
   const getHistogramPercentileValue = (data, percentile) => {
     if (!data || !data.counts || data.counts.length === 0) return null;
@@ -979,58 +950,85 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return data.max;
   };
 
-
   const updateStretchInput = (channel, field, value) => {
     setStretchValues((prev) => ({ ...prev, [channel]: { ...prev[channel], [field]: value } }));
   };
 
-
   const applyStretchWithValues = (channel, minVal, maxVal) => {
-    const nextStretch = { ...stretchValues, [channel]: { min: minVal, max: maxVal } };
-    setStretchValues(nextStretch);
+  const nextStretch = { ...stretchValues, [channel]: { min: minVal, max: maxVal } };
+  setStretchValues(nextStretch);
 
+  if (activeContainer) {
+    containerStretchRef.current[activeContainer] = cloneStretchValues(nextStretch);
+  }
 
-    if (activeContainer) {
-      containerStretchRef.current[activeContainer] = cloneStretchValues(nextStretch);
-    }
+  // Save current viewport before reloading
+  let currentViewport = null;
+  if (viewerRef.current?.viewport) {
+    try {
+      const vp = viewerRef.current.viewport;
+      const center = vp.getCenter();
+      currentViewport = {
+        osdZoom: vp.getZoom(),
+        osdCenter: { x: center.x, y: center.y },
+      };
+    } catch (_) {}
+  }
 
-
-    if (channel === "default") {
-      const file = histDropdownFile || selectedFile;
-      if (!file) return;
-      saveFileStretch(file, "default", minVal, maxVal);
-      setSelectedFile(file);
-      setViewMode("raster");
-      loadImage(buildSingleImageUrl(file, nextStretch.default), rasterViewKey(file));
-      setHistSelectedRange({ filename: file, channel: "default", min: minVal, max: maxVal });
-      return;
-    }
-    const isRgbComposite = rFile && gFile && bFile;
-    if (isRgbComposite) {
-      const channelFile = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
-      saveFileStretch(channelFile, channel, minVal, maxVal);
-      setSelectedFile(null);
-      setViewMode("rgb");
-      loadImage(buildCompositeUrl(rFile, gFile, bFile, nextStretch), compositeViewKey(rFile, gFile, bFile));
-      if (channelFile) {
-        setHistSelectedRange({ filename: channelFile, channel, min: minVal, max: maxVal });
-      }
-      return;
-    }
-    const targetFile = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
-    const fileToUse = targetFile || selectedFile;
-    if (!fileToUse) return;
-    saveFileStretch(fileToUse, channel, minVal, maxVal);
-    setSelectedFile(fileToUse);
+  if (channel === "default") {
+    const file = histDropdownFile || selectedFile;
+    if (!file) return;
+    saveFileStretch(file, "default", minVal, maxVal);
+    setSelectedFile(file);
     setViewMode("raster");
-    loadImage(buildSingleImageUrl(fileToUse, nextStretch[channel]), rasterViewKey(fileToUse));
-    setHistSelectedRange({ filename: fileToUse, channel, min: minVal, max: maxVal });
-  };
+    loadImage(
+      buildSingleImageUrl(file, nextStretch.default),
+      rasterViewKey(file),
+      true,                // preserveView
+      currentViewport      // keep same zoom/pan
+    );
+    setHistSelectedRange({ filename: file, channel: "default", min: minVal, max: maxVal });
+    return;
+  }
+
+  const isRgbComposite = rFile && gFile && bFile;
+  if (isRgbComposite) {
+    const channelFile = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
+    saveFileStretch(channelFile, channel, minVal, maxVal);
+    setSelectedFile(null);
+    setViewMode("rgb");
+    loadImage(
+      buildCompositeUrl(rFile, gFile, bFile, nextStretch),
+      compositeViewKey(rFile, gFile, bFile),
+      true,
+      currentViewport
+    );
+    if (channelFile) {
+      setHistSelectedRange({ filename: channelFile, channel, min: minVal, max: maxVal });
+    }
+    return;
+  }
+
+  const targetFile = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
+  const fileToUse = targetFile || selectedFile;
+  if (!fileToUse) return;
+  saveFileStretch(fileToUse, channel, minVal, maxVal);
+  setSelectedFile(fileToUse);
+  setViewMode("raster");
+  loadImage(
+    buildSingleImageUrl(fileToUse, nextStretch[channel]),
+    rasterViewKey(fileToUse),
+    true,
+    currentViewport
+  );
+  setHistSelectedRange({ filename: fileToUse, channel, min: minVal, max: maxVal });
+};
   const applyStretch = (channel) => {
     const s = stretchValues[channel];
     if (!s) return;
     applyStretchWithValues(channel, s.min, s.max);
   };
+
   const applyAutoStretch = (channel, lowPct, highPct) => {
     const data =
       channel === "default" ? histDefaultData :
@@ -1044,22 +1042,20 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     const highVal = highPct >= 100 ? data.max : getHistogramPercentileValue(data, highPct);
     applyStretchWithValues(channel, lowVal, highVal);
   };
+
   const resetStretch = (channel) => {
     const noStretch = createEmptyStretchValues();
     setStretchValues(noStretch);
 
-
     if (activeContainer) {
       containerStretchRef.current[activeContainer] = noStretch;
     }
-
 
     setShowHistogram(false);
     setHistActiveChannel(null);
     setHistSelectedRange(null);
     setHistSelectedChannel(null);
     rgbBeforeHistRef.current = null;
-
 
     if (rFile && gFile && bFile) {
       setViewMode("rgb");
@@ -1083,7 +1079,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }
   };
 
-
   const applyRGBFromFiles = useCallback(
     (containerName, files) => {
       if (files.length === 0) {
@@ -1093,11 +1088,9 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
         return;
       }
 
-
       const r = files[0];
       const g = files[1] || files[0];
       const b = files[2] || g;
-
 
       setRFile(r);
       setGFile(g);
@@ -1117,10 +1110,12 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     },
     [stretchValues]
   );
+
   const autoSelectRGBForContainer = (containerName) => {
     const files = containers[containerName] || [];
     applyRGBFromFiles(containerName, files);
   };
+
   const restoreContainerView = (containerName) => {
     if (!containerName) return;
     const saved = containerViewStateRef.current[containerName];
@@ -1129,84 +1124,77 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       setPosition(saved.position);
     }
   };
-  const recomputeRGBAfterDelete = (containerName, deletedFilename) => {
-    const remainingFiles = (containers[containerName] || []).filter(
-      (f) => f !== deletedFilename
-    );
 
+ const recomputeRGBAfterDelete = (containerName, deletedFilename) => {
+  const remainingFiles = (containers[containerName] || []).filter(
+    (f) => f !== deletedFilename
+  );
 
-    if (remainingFiles.length === 0) {
-      setRFile("");
-      setGFile("");
-      setBFile("");
-      setSelectedFile(null);
-      setViewMode("");
-      setDisplayedImageUrl("");
-      setRasterInfo(null);
-      delete containerRgbRef.current[containerName];
-      delete containerStretchRef.current[containerName];
-      return;
-    }
-
-
-    const r = remainingFiles[0];
-    const g = remainingFiles[1] || remainingFiles[0];
-    const b = remainingFiles[2] || g;
-
-
-    setRFile(r);
-    setGFile(g);
-    setBFile(b);
+  if (remainingFiles.length === 0) {
+    setRFile("");
+    setGFile("");
+    setBFile("");
     setSelectedFile(null);
-    setViewMode("rgb");
-
-
-    containerRgbRef.current[containerName] = { r, g, b };
-
-
-    const noStretch = createEmptyStretchValues();
-    setStretchValues(noStretch);
-    containerStretchRef.current[containerName] = noStretch;
-
-
-    loadImage(
-      buildCompositeUrl(r, g, b, noStretch),
-      compositeViewKey(r, g, b),
-      false
-    );
-
-
-    axios
-      .get(`${API}/metadata`, { params: { filename: r } })
-      .then((res) => setRasterInfo(res.data))
-      .catch((err) => console.error("Failed to load raster info:", err));
-
-
-    setTimeout(() => {
-      restoreContainerView(containerName);
-    }, 0);
-  };
-
-
- const handleFileSelectInput = (e) => {
-  const uploadedFiles = e.target.files;
-  if (!uploadedFiles || uploadedFiles.length === 0) return;
-  const inputEl = e.target;
-  const fileArray = Array.from(uploadedFiles);
-  
-  setPendingFiles(fileArray);
-  inputEl.value = "";
-
-  setContainers((currentContainers) => {
-    const existingNames = Object.keys(currentContainers);
-    if (existingNames.length === 0) {
-      processUploadsToContainer("Container 1", fileArray);
-    } else {
-      setShowContainerModal(true);
+    setViewMode("");
+    setDisplayedImageUrl("");
+    setRasterInfo(null);
+    delete containerRgbRef.current[containerName];
+    delete containerStretchRef.current[containerName];
+    if (viewerRef.current) {
+      try { viewerRef.current.destroy(); } catch (_) {}
+      viewerRef.current = null;
     }
-    return currentContainers;
-  });
+    return;
+  }
+
+  // Rebuild RGB with remaining files
+  const r = remainingFiles[0];
+  const g = remainingFiles[1] || remainingFiles[0];
+  const b = remainingFiles[2] || g;
+
+  setRFile(r);
+  setGFile(g);
+  setBFile(b);
+  setSelectedFile(null);
+  setViewMode("rgb");
+
+  containerRgbRef.current[containerName] = { r, g, b };
+
+  const noStretch = createEmptyStretchValues();
+  setStretchValues(noStretch);
+  containerStretchRef.current[containerName] = noStretch;
+
+  loadImage(
+    buildCompositeUrl(r, g, b, noStretch),
+    compositeViewKey(r, g, b),
+    false
+  );
+
+  axios
+    .get(`${API}/metadata`, { params: { filename: r } })
+    .then((res) => setRasterInfo(res.data))
+    .catch((err) => console.error("Failed to load raster info:", err));
 };
+
+  const handleFileSelectInput = (e) => {
+    const uploadedFiles = e.target.files;
+    if (!uploadedFiles || uploadedFiles.length === 0) return;
+    const inputEl = e.target;
+    const fileArray = Array.from(uploadedFiles);
+
+    setPendingFiles(fileArray);
+    inputEl.value = "";
+
+    setContainers((currentContainers) => {
+      const existingNames = Object.keys(currentContainers);
+      if (existingNames.length === 0) {
+        processUploadsToContainer("Container 1", fileArray);
+      } else {
+        setShowContainerModal(true);
+      }
+      return currentContainers;
+    });
+  };
 
   const getNextContainerName = () => {
     const names = Object.keys(containers);
@@ -1221,58 +1209,52 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return `Container ${maxNum + 1}`;
   };
 
-
   const processUploadsToContainer = async (targetContainerName, filesToUpload) => {
-  setShowContainerModal(false);
+    setShowContainerModal(false);
 
-  // Add files to container IMMEDIATELY (before upload)
-  for (const file of filesToUpload) {
-    const storedFilePath = `${targetContainerName}/${file.name}`;
-    
-    setContainers((prev) => {
-      const existingFiles = prev[targetContainerName] || [];
-      if (existingFiles.includes(storedFilePath)) return prev;
-      
-      const updatedFiles = [...existingFiles, storedFilePath];
-      return { ...prev, [targetContainerName]: updatedFiles };
-    });
-    
-    setFileDisplayNames((prev) => ({ ...prev, [storedFilePath]: file.name }));
-  }
+    for (const file of filesToUpload) {
+      const storedFilePath = `${targetContainerName}/${file.name}`;
 
-  // Upload in background
-  for (const file of filesToUpload) {
-    const storedFilePath = `${targetContainerName}/${file.name}`;
-    
-    try {
-      const result = await uploadFileChunked(file, targetContainerName, (percent) => {
-        setUploadProgress(percent);
-      });
-
-      setActiveContainer(targetContainerName);
-      setActiveRgbContainer(targetContainerName);
-
-      showToast(`${file.name} stored in ${targetContainerName}`, "success");
-    } catch (error) {
-      console.error("Upload failed:", error);
-      showToast(`Upload failed for ${file.name}: ${error.message}`, "error");
-      
-      // Remove failed file from container
       setContainers((prev) => {
-        const updatedFiles = (prev[targetContainerName] || []).filter(f => f !== storedFilePath);
+        const existingFiles = prev[targetContainerName] || [];
+        if (existingFiles.includes(storedFilePath)) return prev;
+
+        const updatedFiles = [...existingFiles, storedFilePath];
         return { ...prev, [targetContainerName]: updatedFiles };
       });
-      break;
+
+      setFileDisplayNames((prev) => ({ ...prev, [storedFilePath]: file.name }));
     }
-  }
-  setPendingFiles([]);
-};
-    const handleDeleteContainer = (containerName) => {
+
+    for (const file of filesToUpload) {
+      const storedFilePath = `${targetContainerName}/${file.name}`;
+
+      try {
+        const result = await uploadFileChunked(file, targetContainerName, (percent) => {
+          setUploadProgress(percent);
+        });
+
+        setActiveContainer(targetContainerName);
+        setActiveRgbContainer(targetContainerName);
+
+      } catch (error) {
+        console.error("Upload failed:", error);
+        showToast(`Upload failed for ${file.name}: ${error.message}`, "error");
+
+        setContainers((prev) => {
+          const updatedFiles = (prev[targetContainerName] || []).filter(f => f !== storedFilePath);
+          return { ...prev, [targetContainerName]: updatedFiles };
+        });
+        break;
+      }
+    }
+    setPendingFiles([]);
+  };
+
+  const handleDeleteContainer = (containerName) => {
     if (!window.confirm(`Delete entire container "${containerName}" and all its rasters?`)) return;
 
-
     const files = containers[containerName] || [];
-
 
     Promise.all(
       files.map((f) => axios.delete(`${API}/files/${encodeURIComponent(f)}`).catch(() => {}))
@@ -1283,13 +1265,11 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
         return updated;
       });
 
-
       setFileDisplayNames((prev) => {
         const updated = { ...prev };
         files.forEach((f) => delete updated[f]);
         return updated;
       });
-
 
       files.forEach((f) => {
         delete viewStateRef.current[rasterViewKey(f)];
@@ -1299,11 +1279,9 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
         }
       });
 
-
       delete containerRgbRef.current[containerName];
       delete containerStretchRef.current[containerName];
       delete containerViewStateRef.current[containerName];
-
 
       if (activeContainer === containerName) {
         setActiveContainer(null);
@@ -1314,170 +1292,219 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
         setRasterInfo(null);
       }
 
-
       showToast(`Container "${containerName}" deleted`, "success");
     });
   };
 
-
   const resetView = () => {
-    const viewer = viewerRef.current;
-    userHasSetViewRef.current = false;
-    if (viewer?.viewport) {
-      viewer.viewport.goHome(true);
-      viewer.viewport.applyConstraints();
-      saveCurrentImageHistory();
-      return;
-    }
-    setScale(1);
-    setPosition({ x: 0, y: 0 });
-  };
+  const viewer = viewerRef.current;
+  userHasSetViewRef.current = false;
+
+  if (viewer?.viewport) {
+    viewer.viewport.goHome(true);          // back to 100%
+    viewer.viewport.applyConstraints();
+    saveCurrentImageHistory();
+    return;
+  }
+
+  // Fallback if viewer is not ready
+  setScale(1);
+  setPosition({ x: 0, y: 0 });
+};
 
   const handleSelectRaster = async (filename) => {
-    if (isSwipeMode) return;
-    saveCurrentImageHistory();
-    const containerName = getContainerForFile(filename) || activeContainer;
-    if (containerName) lastViewedFileByContainerRef.current[containerName] = filename;
-    const saved = getSavedImageHistory(containerName, filename);
-    setHistoryContext(containerName, filename);
+  if (isSwipeMode) return;
 
+  // Save current view before leaving
+  saveCurrentImageHistory();
 
-    if (saved) {
-      setSelectedFile(filename);
-      setViewMode(saved.viewMode || (saved.rFile && saved.gFile && saved.bFile ? "rgb" : "raster"));
-      setRFile(saved.rFile || "");
-      setGFile(saved.gFile || "");
-      setBFile(saved.bFile || "");
-      setStretchValues(cloneStretchValues(saved.stretchValues));
-      setHistDropdownFile(saved.histDropdownFile || filename);
-      setHistActiveChannel(saved.histActiveChannel || null);
-      setHistSelectedRange(saved.histSelectedRange || null);
-      setHistSelectedChannel(saved.histSelectedChannel || null);
-      setShowHistogram(Boolean(saved.showHistogram));
-      setActiveContainer(containerName || "");
-      setActiveRgbContainer(containerName || "");
+  const containerName = getContainerForFile(filename) || activeContainer;
+  if (containerName) lastViewedFileByContainerRef.current[containerName] = filename;
 
+  const saved = getSavedImageHistory(containerName, filename);
+  setHistoryContext(containerName, filename);
 
-      const isSavedRgb = saved.rFile && saved.gFile && saved.bFile;
-      if (isSavedRgb) {
-        setSelectedFile(null);
-        setViewMode("rgb");
-        loadImage(
-          buildCompositeUrl(saved.rFile, saved.gFile, saved.bFile, saved.stretchValues),
-          compositeViewKey(saved.rFile, saved.gFile, saved.bFile),
-          false,
-          saved
-        );
-      } else {
-        setSelectedFile(filename);
-        setViewMode("raster");
-        loadImage(
-          buildSingleImageUrl(filename, saved.stretchValues?.default || { min: "", max: "" }),
-          rasterViewKey(filename),
-          false,
-          saved
-        );
-      }
+  if (saved) {
+    // ---------- INSTANT RESTORE ----------
+    setSelectedFile(filename);
+    setViewMode(saved.viewMode || (saved.rFile && saved.gFile && saved.bFile ? "rgb" : "raster"));
+    setRFile(saved.rFile || "");
+    setGFile(saved.gFile || "");
+    setBFile(saved.bFile || "");
+    setStretchValues(cloneStretchValues(saved.stretchValues));
+    setHistDropdownFile(saved.histDropdownFile || filename);
+    setHistActiveChannel(saved.histActiveChannel || null);
+    setHistSelectedRange(saved.histSelectedRange || null);
+    setHistSelectedChannel(saved.histSelectedChannel || null);
+    setShowHistogram(Boolean(saved.showHistogram));
+    setActiveContainer(containerName || "");
+    setActiveRgbContainer(containerName || "");
 
+    // 1. Show the previous overview INSTANTLY if we still have it in memory
+    if (saved.displayedImageUrl) {
+      setDisplayedImageUrl(saved.displayedImageUrl);
+      setShowOverviewInViewport(true);
+      setIsImageLoading(false);
+    }
 
-      if (saved.showHistogram) {
-        setHistDefaultData(null);
-        fetchHistogramFor(filename, setHistDefaultLoading, setHistDefaultData);
-        if (saved.rFile) fetchChannelHistogram(saved.rFile, "r");
-        if (saved.gFile) fetchChannelHistogram(saved.gFile, "g");
-        if (saved.bFile) fetchChannelHistogram(saved.bFile, "b");
-      } else {
-        setHistDefaultData(null);
-      }
+    const isSavedRgb = saved.rFile && saved.gFile && saved.bFile;
 
+    if (isSavedRgb) {
+      setSelectedFile(null);
+      setViewMode("rgb");
+      loadImage(
+        buildCompositeUrl(saved.rFile, saved.gFile, saved.bFile, saved.stretchValues),
+        compositeViewKey(saved.rFile, saved.gFile, saved.bFile),
+        true,               // preserveView
+        saved               // restore exact zoom + pan
+      );
     } else {
       setSelectedFile(filename);
       setViewMode("raster");
-      setHistSelectedRange(null);
-      setHistActiveChannel(null);
-      setHistDropdownFile(filename);
+      loadImage(
+        buildSingleImageUrl(filename, saved.stretchValues?.default || { min: "", max: "" }),
+        rasterViewKey(filename),
+        true,               // preserveView
+        saved
+      );
+    }
+
+    if (saved.showHistogram) {
       setHistDefaultData(null);
-      setShowHistogram(false);
-      const restoredStretch = getFileStretch(filename);
-      setStretchValues(restoredStretch);
-      setRFile("");
-      setGFile("");
-      setBFile("");
-      setHistR(null);
-      setHistG(null);
-      setHistB(null);
-      loadImage(buildSingleImageUrl(filename, restoredStretch.default), rasterViewKey(filename));
-
+      fetchHistogramFor(filename, setHistDefaultLoading, setHistDefaultData);
+      if (saved.rFile) fetchChannelHistogram(saved.rFile, "r");
+      if (saved.gFile) fetchChannelHistogram(saved.gFile, "g");
+      if (saved.bFile) fetchChannelHistogram(saved.bFile, "b");
     }
+  } else {
+    // First time opening this file
+    setSelectedFile(filename);
+    setViewMode("raster");
+    setHistSelectedRange(null);
+    setHistActiveChannel(null);
+    setHistDropdownFile(filename);
+    setHistDefaultData(null);
+    setShowHistogram(false);
+    const restoredStretch = getFileStretch(filename);
+    setStretchValues(restoredStretch);
+    setRFile("");
+    setGFile("");
+    setBFile("");
+    setHistR(null);
+    setHistG(null);
+    setHistB(null);
+    loadImage(buildSingleImageUrl(filename, restoredStretch.default), rasterViewKey(filename));
+  }
 
+  if (containerName) {
+    setActiveContainer(containerName);
+    setActiveRgbContainer(containerName);
+  }
 
-    if (containerName) {
-      setActiveContainer(containerName);
-      setActiveRgbContainer(containerName);
+  // Metadata (non-blocking)
+  const metadataRequestId = loadSequenceRef.current;
+  try {
+    const res = await axios.get(`${API}/metadata`, { params: { filename } });
+    if (metadataRequestId === loadSequenceRef.current) {
+      setRasterInfo(res.data);
     }
+  } catch (err) {
+    // ignore
+  }
+};
 
-
-    const metadataRequestId = loadSequenceRef.current;
-    try {
-      const res = await axios.get(`${API}/metadata`, { params: { filename } });
-      if (metadataRequestId === loadSequenceRef.current) {
-        setRasterInfo(res.data);
-      }
-    } catch (err) {
-      if (metadataRequestId === loadSequenceRef.current) {
-        console.error("Failed to load raster info:", err);
-      }
-    }
-  };
   const handleDeleteRaster = async (e, filename) => {
-    e.stopPropagation();
-    const displayName = getDisplayName(filename);
-    if (!window.confirm(`Delete ${displayName}?`)) return;
+  e.stopPropagation();
+  const displayName = getDisplayName(filename);
+  if (!window.confirm(`Delete ${displayName}?`)) return;
 
+  const containerName = getContainerForFile(filename) || activeContainer;
+  const wasSelected = selectedFile === filename;
+  const wasInRGB = rFile === filename || gFile === filename || bFile === filename;
+  const isCurrentlyViewed =
+    wasSelected ||
+    (viewMode === "rgb" && (rFile === filename || gFile === filename || bFile === filename)) ||
+    (viewMode === "swipe" && (swipeLeftFile === filename || swipeRightFile === filename));
 
-    const containerName = getContainerForFile(filename) || activeContainer;
-    const wasInRGB = rFile === filename || gFile === filename || bFile === filename;
-    const wasSelected = selectedFile === filename;
+  try {
+    await axios.delete(`${API}/files/${encodeURIComponent(filename)}`);
 
-
-    try {
-      await axios.delete(`${API}/files/${encodeURIComponent(filename)}`);
-      setContainers((prev) => {
-        const updated = {};
-        for (const [cName, list] of Object.entries(prev)) {
-          const filtered = list.filter((f) => f !== filename);
-          if (filtered.length > 0) updated[cName] = filtered;
-        }
-        return updated;
-      });
-      setFileDisplayNames((prev) => {
-        const updated = { ...prev };
-        delete updated[filename];
-        return updated;
-      });
-      delete viewStateRef.current[rasterViewKey(filename)];
-      delete stretchStateRef.current[filename];
-      for (const key of Object.keys(imageHistoryRef.current)) {
-        if (key.endsWith(`:${filename}`)) delete imageHistoryRef.current[key];
+    // 1. Remove from containers state
+    setContainers((prev) => {
+      const updated = {};
+      for (const [cName, list] of Object.entries(prev)) {
+        const filtered = list.filter((f) => f !== filename);
+        if (filtered.length > 0) updated[cName] = filtered;
       }
+      return updated;
+    });
 
+    // 2. Clean up caches & state
+    setFileDisplayNames((prev) => {
+      const updated = { ...prev };
+      delete updated[filename];
+      return updated;
+    });
 
-      if (swipeLeftFile === filename) setSwipeLeftFile("");
-      if (swipeRightFile === filename) setSwipeRightFile("");
-
-
-      if (wasSelected || (containerName && activeContainer === containerName && wasInRGB)) {
-        recomputeRGBAfterDelete(containerName, filename);
-      }
-
-
-      showToast(`${displayName} deleted`, "success");
-    } catch (err) {
-      console.error("Delete failed:", err);
-      showToast(`Failed to delete ${displayName}`, "error");
+    delete viewStateRef.current[rasterViewKey(filename)];
+    delete stretchStateRef.current[filename];
+    delete metadataCacheRef.current[filename];
+    for (const key of Object.keys(imageHistoryRef.current)) {
+      if (key.endsWith(`:${filename}`)) delete imageHistoryRef.current[key];
     }
-  };
+    for (const key of Object.keys(overviewBlobCacheRef.current)) {
+      if (key.includes(encodeURIComponent(filename))) delete overviewBlobCacheRef.current[key];
+    }
 
+    if (swipeLeftFile === filename) setSwipeLeftFile("");
+    if (swipeRightFile === filename) setSwipeRightFile("");
+
+    // 3. Smart viewport recovery
+    if (isCurrentlyViewed && containerName) {
+      const remainingFiles = (containers[containerName] || []).filter(
+        (f) => f !== filename
+      );
+
+      if (remainingFiles.length === 0) {
+        // Container is now empty → clear viewport cleanly
+        setSelectedFile(null);
+        setViewMode("");
+        setDisplayedImageUrl("");
+        setRasterInfo(null);
+        setRFile("");
+        setGFile("");
+        setBFile("");
+        setActiveContainer(null);
+        setActiveRgbContainer("");
+        if (viewerRef.current) {
+          try { viewerRef.current.destroy(); } catch (_) {}
+          viewerRef.current = null;
+        }
+      } else {
+        // Automatically switch to another file in the same container
+        const nextFile = remainingFiles[0];
+
+        // Prefer keeping RGB if possible
+        if (wasInRGB && remainingFiles.length >= 1) {
+          recomputeRGBAfterDelete(containerName, filename);
+        } else {
+          // Switch to single-band view of the next available file
+          setTimeout(() => {
+            handleSelectRaster(nextFile);
+          }, 50);
+        }
+      }
+    } else if (wasInRGB) {
+      // File was part of RGB but not the main selected one
+      recomputeRGBAfterDelete(containerName, filename);
+    }
+
+    showToast(`${displayName} deleted`, "success");
+  } catch (err) {
+    console.error("Delete failed:", err);
+    showToast(`Failed to delete ${displayName}`, "error");
+  }
+};
 
   const handleDownload = async () => {
     if (!displayedImageUrl && !isSwipeMode) return;
@@ -1503,7 +1530,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }
   };
 
-
   const fetchHistogramFor = async (filename, setLoading, setData) => {
     if (!filename) return;
     setLoading(true);
@@ -1518,7 +1544,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }
   };
 
-
   const fetchChannelHistogram = (filename, channel) => {
     const setLoading =
       channel === "r" ? setHistRLoading :
@@ -1528,70 +1553,97 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       channel === "g" ? setHistG : setHistB;
     fetchHistogramFor(filename, setLoading, setData);
   };
+  
+const handleRGBChange = (channel, value) => {
+  if (isSwipeMode) return;
 
+  // Save current zoom & pan before changing
+  let currentViewport = null;
+  if (viewerRef.current?.viewport) {
+    try {
+      const vp = viewerRef.current.viewport;
+      const center = vp.getCenter();
+      currentViewport = {
+        osdZoom: vp.getZoom(),
+        osdCenter: { x: center.x, y: center.y },
+      };
+    } catch (_) {}
+  }
 
-  const handleRGBChange = (channel, value) => {
-    if (isSwipeMode) return;
-    saveCurrentImageHistory();
+  // Update the selected channel
+  let nextR = rFile, nextG = gFile, nextB = bFile;
+  if (channel === "r") { nextR = value; setRFile(value); }
+  if (channel === "g") { nextG = value; setGFile(value); }
+  if (channel === "b") { nextB = value; setBFile(value); }
 
+  if (activeContainer) {
+    containerRgbRef.current[activeContainer] = { r: nextR, g: nextG, b: nextB };
+  }
 
-    let nextR = rFile, nextG = gFile, nextB = bFile;
-    if (channel === "r") { nextR = value; setRFile(value); }
-    if (channel === "g") { nextG = value; setGFile(value); }
-    if (channel === "b") { nextB = value; setBFile(value); }
+  // Only load when all three channels are selected
+  if (nextR && nextG && nextB) {
+    setSelectedFile(null);
+    setViewMode("rgb");
 
+    // Keep current stretch values
+    const currentStretch = stretchValues;
 
-    if (activeContainer) {
-      containerRgbRef.current[activeContainer] = { r: nextR, g: nextG, b: nextB };
-    }
-
-
-    const isRgbComposite = nextR && nextG && nextB;
-    if (isRgbComposite) {
-      setSelectedFile(null);
-      setViewMode("rgb");
-
-
-      const noStretch = createEmptyStretchValues();
-      setStretchValues(noStretch);
-
-
-      if (activeContainer) {
-        containerStretchRef.current[activeContainer] = noStretch;
-      }
-
-
-      loadImage(buildCompositeUrl(nextR, nextG, nextB, noStretch), compositeViewKey(nextR, nextG, nextB), true);
-
-
-      setTimeout(() => {
-        if (activeContainer) restoreContainerView(activeContainer);
-      }, 0);
-    }
-  };
-
+    loadImage(
+      buildCompositeUrl(nextR, nextG, nextB, currentStretch),
+      compositeViewKey(nextR, nextG, nextB),
+      true,                 // preserve view
+      currentViewport       // keep same zoom + pan
+    );
+  }
+};
 
   const selectHistChannel = (channel) => {
-    saveCurrentImageHistory();
-    const file = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
-    if (!file) {
-      showToast(`Select a file for the ${channel.toUpperCase()} channel first.`, "error");
-      return;
-    }
-    setHistActiveChannel(channel);
-    fetchChannelHistogram(file, channel);
-    const isRgbComposite = rFile && gFile && bFile;
-    if (isRgbComposite) {
-      setSelectedFile(null);
-      setViewMode("rgb");
-      loadImage(buildCompositeUrl(rFile, gFile, bFile, stretchValues), compositeViewKey(rFile, gFile, bFile), true);
-    } else {
-      setSelectedFile(file);
-      setViewMode("raster");
-      loadImage(buildSingleImageUrl(file, stretchValues[channel]), rasterViewKey(file), true);
-    }
-  };
+  saveCurrentImageHistory();
 
+  const file = channel === "r" ? rFile : channel === "g" ? gFile : bFile;
+  if (!file) {
+    showToast(`Select a file for the ${channel.toUpperCase()} channel first.`, "error");
+    return;
+  }
+
+  // Save current zoom & pan
+  let currentViewport = null;
+  if (viewerRef.current?.viewport) {
+    try {
+      const vp = viewerRef.current.viewport;
+      const center = vp.getCenter();
+      currentViewport = {
+        osdZoom: vp.getZoom(),
+        osdCenter: { x: center.x, y: center.y },
+      };
+    } catch (_) {}
+  }
+
+  setHistActiveChannel(channel);
+  fetchChannelHistogram(file, channel);
+
+  const isRgbComposite = rFile && gFile && bFile;
+
+  if (isRgbComposite) {
+    setSelectedFile(null);
+    setViewMode("rgb");
+    loadImage(
+      buildCompositeUrl(rFile, gFile, bFile, stretchValues),
+      compositeViewKey(rFile, gFile, bFile),
+      true,                 // preserve view
+      currentViewport       // keep same zoom + pan
+    );
+  } else {
+    setSelectedFile(file);
+    setViewMode("raster");
+    loadImage(
+      buildSingleImageUrl(file, stretchValues[channel]),
+      rasterViewKey(file),
+      true,
+      currentViewport
+    );
+  }
+};
 
   const toggleSwipeMode = () => {
     if (isSwipeMode) {
@@ -1645,7 +1697,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     showToast("Swipe Compare mode activated", "success");
   };
 
-
   useEffect(() => {
     const handleWindowMouseMove = (e) => {
       if (!isDraggingSwipeDivider || !containerRef.current) return;
@@ -1664,7 +1715,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       window.removeEventListener("mouseup", handleWindowMouseUp);
     };
   }, [isDraggingSwipeDivider]);
-
 
   useEffect(() => {
     if (!histBoxDrag) return;
@@ -1698,7 +1748,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     };
   }, [histBoxDrag, histR, histG, histB, histDefaultData]);
 
-
   useEffect(() => {
     return () => {
       if (abortControllerRef.current) abortControllerRef.current.abort();
@@ -1710,15 +1759,12 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     };
   }, []);
 
-
   const openHistogramModal = () => {
     if (activeFilesPool.length === 0 && allFilesList.length === 0) {
       return showToast("No files in active container. Select a container first.", "error");
     }
 
-
     saveCurrentImageHistory();
-
 
     if (viewMode === "rgb" && rFile && gFile && bFile) {
       rgbBeforeHistRef.current = {
@@ -1731,17 +1777,14 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       rgbBeforeHistRef.current = null;
     }
 
-
     const defaultFile =
       (selectedFile && activeFilesPool.includes(selectedFile)) ? selectedFile : activeFilesPool[0];
     if (!defaultFile) return;
-
 
     setHistDropdownFile(histDropdownFile || defaultFile);
     setHistActiveChannel(histActiveChannel || null);
     setHistDefaultData(null);
     fetchHistogramFor(histDropdownFile || defaultFile, setHistDefaultLoading, setHistDefaultData);
-
 
     setShowHistogram(true);
     setShowScatterPlot(false);
@@ -1749,10 +1792,8 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     setIsProfileMode(false);
   };
 
-
   const closeHistogramAndRestore = () => {
     saveCurrentImageHistory();
-
 
     setShowHistogram(false);
     setHistActiveChannel(null);
@@ -1760,36 +1801,29 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     setHistSelectedChannel(null);
   };
 
-
   const openScatterPlotModal = () => {
     if (activeFilesPool.length === 0) {
       return showToast("No files in active container. Select a container first.", "error");
     }
 
-
     let defaultXFile = rFile || activeFilesPool[0];
     let defaultYFile = gFile || rFile || activeFilesPool[0];
 
-
     if (!defaultXFile) defaultXFile = activeFilesPool[0];
     if (!defaultYFile) defaultYFile = defaultXFile;
-
 
     setScatterXFile(defaultXFile);
     setScatterYFile(defaultYFile);
     setScatterXBand(1);
     setScatterYBand(1);
 
-
     setShowHistogram(false);
     setShowScatterPlot(true);
     setShowProfileModal(false);
     setIsProfileMode(false);
 
-
     fetchScatterPlotData(defaultXFile, 1, defaultYFile, 1);
   };
-
 
   const fetchScatterPlotData = async (xFile, xBand, yFile, yBand) => {
     if (!xFile || !yFile) return;
@@ -1810,30 +1844,24 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }
   };
 
-
   const openProfilePlotModal = () => {
     if (activeFilesPool.length === 0) {
       return showToast("No files in active container. Select a container first.", "error");
     }
 
-
     let defaultFile = rFile || activeFilesPool[0];
     if (!defaultFile) defaultFile = activeFilesPool[0];
 
-
     setProfileFile(defaultFile);
     setSelectedProfileBand(1);
-
 
     setShowHistogram(false);
     setShowScatterPlot(false);
     setShowProfileModal(false);
     setIsProfileMode(true);
 
-
     showToast("Click start and end points on the image.", "success");
   };
-
 
   const fetchProfilePlot = async (pStart, pEnd, filename, band = 1) => {
     if (!filename || !pStart || !pEnd) return;
@@ -1851,7 +1879,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       setIsProfileLoading(false);
     }
   };
-
 
   const handleZoomIn = () => {
     const viewer = viewerRef.current;
@@ -1881,11 +1908,11 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }),
     [position, scale]
   );
-    const renderHistogramBlock = (channelKey, color, label, file, data, loading) => {
+
+  const renderHistogramBlock = (channelKey, color, label, file, data, loading) => {
     if (loading) return <div style={{ textAlign: "center", padding: "20px", color: "#94a3b8", fontSize: "12px" }}>Loading chart...</div>;
     if (!data) return <div style={{ color: "#64748b", fontSize: "11px", fontStyle: "italic" }}>No histogram data for {label} yet.</div>;
     const stretch = stretchValues[channelKey] || { min: "", max: "" };
-
 
     return (
       <div>
@@ -1968,7 +1995,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
             </div>
           )}
 
-
           {(stretch.min !== "" || stretch.max !== "") && (
             <div
               style={{
@@ -2013,10 +2039,8 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
                   const sMin = stretch.min !== "" ? Number(stretch.min) : data.min;
                   const sMax = stretch.max !== "" ? Number(stretch.max) : data.max;
 
-
                   const visible = binMax > sMin && binMin < sMax;
                   const opacity = visible ? 1 : 0.15;
-
 
                   return (
                     <div
@@ -2072,7 +2096,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     );
   };
 
-
   return (
     <div style={styles.appContainer}>
       <div style={styles.sidebar}>
@@ -2084,7 +2107,7 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
           <span>📥 Import Rasters</span>
           <input type="file" multiple accept=".tif,.tiff" onChange={handleFileSelectInput} style={{ display: "none" }} />
         </label>
-       
+
         <div style={styles.sectionHeader}>
           Containers & Datasets <span style={styles.badge}>{allFilesList.length}</span>
         </div>
@@ -2110,21 +2133,48 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
                       userSelect: "none",
                     }}
                     onClick={() => {
-                      saveCurrentImageHistory();
-                      setActiveContainer(containerName);
-                      setActiveRgbContainer(containerName);
-                      setHistActiveChannel(null);
-                      setHistDropdownFile("");
-                      setShowHistogram(false);
+  saveCurrentImageHistory();
+  setActiveContainer(containerName);
+  setActiveRgbContainer(containerName);
+  setHistActiveChannel(null);
+  setHistDropdownFile("");
+  setShowHistogram(false);
 
-                      const filesInContainer = containers[containerName] || [];
-                      const lastFile = lastViewedFileByContainerRef.current[containerName];
-                      const candidate = lastFile && filesInContainer.includes(lastFile)
-                        ? lastFile
-                        : filesInContainer[0];
+  const filesInContainer = containers[containerName] || [];
 
-                      if (candidate) handleSelectRaster(candidate);
-                    }}
+  if (filesInContainer.length === 0) return;
+
+  // Auto set RGB according to number of files
+  let r, g, b;
+  if (filesInContainer.length === 1) {
+    r = g = b = filesInContainer[0];
+  } else if (filesInContainer.length === 2) {
+    r = filesInContainer[0];
+    g = filesInContainer[1];
+    b = filesInContainer[1];          // repeat the second
+  } else {
+    r = filesInContainer[0];
+    g = filesInContainer[1];
+    b = filesInContainer[2];
+  }
+
+  setRFile(r);
+  setGFile(g);
+  setBFile(b);
+  setSelectedFile(null);
+  setViewMode("rgb");
+
+  containerRgbRef.current[containerName] = { r, g, b };
+
+  const noStretch = createEmptyStretchValues();
+  setStretchValues(noStretch);
+
+  loadImage(
+    buildCompositeUrl(r, g, b, noStretch),
+    compositeViewKey(r, g, b),
+    false
+  );
+}}
                   >
                     <span style={{ flex: 1 }}>
                       📦 {containerName} {isContainerActive && "(Active)"}
@@ -2132,45 +2182,42 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
                     <span style={styles.badge}>{files.length}</span>
                   </div>
 
-                 {files.map((filePath) => {
-  const fileName = getDisplayFilename(filePath);
-  const isSelected = selectedFile === filePath;
-  return (
-    <div
-      key={filePath}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (isSwipeMode) return;
-        setActiveContainer(containerName);
-        setActiveRgbContainer(containerName);
-        handleSelectRaster(filePath);
-      }}
-      style={{
-        ...styles.rasterCard,
-        borderColor: isSelected ? "#2563eb" : "#2a2d34",
-        background: isSelected ? "#1e293b" : "#14171d",
-        gridTemplateColumns: "1fr 26px", // Changed from "42px 1fr 26px"
-      }}
-    >
-      {/* REMOVE THIS IMG TAG */}
-      {/* <img src={getThumbnailUrl(filePath)} alt={fileName} style={styles.thumbnail} /> */}
-      
-      <div style={styles.rasterInfoText} title={fileName}>
-        <div style={styles.rasterName}>{fileName}</div>
-        <div style={styles.rasterSubtext}>GeoTIFF Dataset</div>
-      </div>
-      <button
-        style={styles.deleteBtn}
-        onClick={(e) => {
-          e.stopPropagation();
-          handleDeleteRaster(e, filePath);
-        }}
-      >
-        ✕
-      </button>
-    </div>
-  );
-})}
+                  {files.map((filePath) => {
+                    const fileName = getDisplayFilename(filePath);
+                    const isSelected = selectedFile === filePath;
+                    return (
+                      <div
+                        key={filePath}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (isSwipeMode) return;
+                          setActiveContainer(containerName);
+                          setActiveRgbContainer(containerName);
+                          handleSelectRaster(filePath);
+                        }}
+                        style={{
+                          ...styles.rasterCard,
+                          borderColor: isSelected ? "#2563eb" : "#2a2d34",
+                          background: isSelected ? "#1e293b" : "#14171d",
+                          gridTemplateColumns: "1fr 26px",
+                        }}
+                      >
+                        <div style={styles.rasterInfoText} title={fileName}>
+                          <div style={styles.rasterName}>{fileName}</div>
+                          <div style={styles.rasterSubtext}>GeoTIFF Dataset</div>
+                        </div>
+                        <button
+                          style={styles.deleteBtn}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteRaster(e, filePath);
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    );
+                  })}
 
                   <button
                     style={{
@@ -2295,8 +2342,8 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
           </div>
         )}
 
-<div ref={containerRef} style={{ ...styles.viewport, position: "relative", overflow: "hidden" }}>     
-       {isSwipeMode ? (
+        <div ref={containerRef} style={{ ...styles.viewport, position: "relative", overflow: "hidden" }}>
+          {isSwipeMode ? (
             <div style={{ position: "relative", width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
               <div style={{ position: "absolute", width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <img src={`${API}/image?filename=${encodeURIComponent(swipeRightFile)}`} alt="Right Layer" draggable={false} style={getImageStyle} onLoad={() => setSwipeRightLoading(false)} onError={() => setSwipeRightLoading(false)} />
@@ -2312,8 +2359,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
             </div>
           ) : (
             <>
-              {/* Fast full-extent overview. It is the same image used by the minimap.
-                  It stays behind the real OpenSeadragon viewport and never captures input. */}
               {displayedImageUrl && showOverviewInViewport && (
                 <img
                   src={displayedImageUrl}
@@ -2346,7 +2391,52 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
             </div>
           )}
           {!isSwipeMode && displayedImageUrl && showMinimap && (
-            <div title="Current viewport location" style={{ ...styles.minimapContainer, right: (showHistogram || showScatterPlot || showProfileModal) ? "378px" : "18px", cursor: "default" }}>
+            <div
+              title="Click to move viewport to this location"
+              onClick={(e) => {
+                const viewer = viewerRef.current;
+                if (!viewer?.viewport || !currentRasterSizeRef.current.width || !currentRasterSizeRef.current.height) return;
+
+                const box = e.currentTarget.getBoundingClientRect();
+                const clickX = e.clientX - box.left;
+                const clickY = e.clientY - box.top;
+                const rasterWidth = currentRasterSizeRef.current.width;
+                const rasterHeight = currentRasterSizeRef.current.height;
+
+                const boxAspect = box.width / box.height;
+                const rasterAspect = rasterWidth / rasterHeight;
+                let renderedWidth = box.width;
+                let renderedHeight = box.height;
+                let offsetX = 0;
+                let offsetY = 0;
+
+                if (rasterAspect > boxAspect) {
+                  renderedHeight = box.width / rasterAspect;
+                  offsetY = (box.height - renderedHeight) / 2;
+                } else {
+                  renderedWidth = box.height * rasterAspect;
+                  offsetX = (box.width - renderedWidth) / 2;
+                }
+
+                if (
+                  clickX < offsetX ||
+                  clickX > offsetX + renderedWidth ||
+                  clickY < offsetY ||
+                  clickY > offsetY + renderedHeight
+                ) return;
+
+                const imageX = ((clickX - offsetX) / renderedWidth) * rasterWidth;
+                const imageY = ((clickY - offsetY) / renderedHeight) * rasterHeight;
+
+                const target = viewer.viewport.imageToViewportCoordinates(imageX, imageY);
+                viewer.viewport.panTo(target, true);
+                viewer.viewport.applyConstraints();
+                userHasSetViewRef.current = true;
+                updateMiniRectFromViewer(rasterWidth, rasterHeight, viewer);
+                saveCurrentImageHistory();
+              }}
+              style={{ ...styles.minimapContainer, right: (showHistogram || showScatterPlot || showProfileModal) ? "378px" : "18px", cursor: "crosshair" }}
+            >
               <img src={displayedImageUrl} alt="minimap" style={styles.minimapImage} draggable={false} />
               <div style={{ ...styles.miniViewportRect, left: `${miniRect.left * 100}%`, top: `${miniRect.top * 100}%`, width: `${Math.max(miniRect.width * 100, 1)}%`, height: `${Math.max(miniRect.height * 100, 1)}%` }} />
             </div>
@@ -2361,7 +2451,7 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
             <p style={styles.modalSubtitle}>Select an existing container or create a new one for your files.</p>
             <div style={styles.modalContainerList}>
               {Object.keys(containers).map((cName) => (
-               <button key={cName} style={styles.modalOptionBtn} onClick={() => processUploadsToContainer(cName, pendingFiles)}>
+                <button key={cName} style={styles.modalOptionBtn} onClick={() => processUploadsToContainer(cName, pendingFiles)}>
                   📁 {cName} ({containers[cName].length} files)
                 </button>
               ))}
@@ -2512,7 +2602,6 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
-
 }
 
 const styles = {

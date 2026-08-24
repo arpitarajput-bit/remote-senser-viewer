@@ -74,13 +74,12 @@ def preview_dimensions(width: int, height: int, max_size: int):
     return max(1, int(width * scale)), max(1, int(height * scale))
 
 def read_preview_band(src, band=1, max_size=PREVIEW_MAX_SIZE):
-    """Read a downsampled raster band for viewport display."""
+    """Fast downsampled read – critical for large files."""
     out_width, out_height = preview_dimensions(src.width, src.height, max_size)
-
     return src.read(
         band,
         out_shape=(out_height, out_width),
-        resampling=Resampling.bilinear,
+        resampling=Resampling.bilinear,   # faster than average for previews
         masked=True,
     )
 
@@ -419,34 +418,40 @@ def get_thumbnail(filename: str = Query(...)):
 @app.get("/api/fast-overview")
 def get_fast_overview(
     filename: str = Query(...),
-    max_size: int = Query(480),
+    max_size: int = Query(300),
 ):
-    """Return the prewarmed small full-extent overview for immediate display."""
+    """Ultra-fast first paint for multi-GB satellite images."""
     validate_file_exists(filename)
-    max_size = max(128, min(int(max_size), 600))
+    max_size = max(128, min(int(max_size), 360))
     cache_key = f"fast-overview:{filename}:{max_size}"
 
     if cache_key in preview_cache:
         return StreamingResponse(
             BytesIO(preview_cache[cache_key]),
             media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=3600"},
+            headers={"Cache-Control": "public, max-age=86400"},
         )
 
-    # Fallback: generate it directly from the stable raw/COG file.
     try:
         file_path = validate_file_exists(filename)
-        ok = prewarm_fast_overview(file_path, filename, max_size=max_size)
-        if not ok:
-            raise RuntimeError("Fast overview generation failed")
-        return StreamingResponse(
-            BytesIO(preview_cache[cache_key]),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
-    except Exception as error:
-        raise HTTPException(status_code=500, detail=f"Failed to render fast overview: {error}")
+        with rasterio.open(file_path) as src:
+            data = read_preview_band(src, max_size=max_size)
+            display_data = brighten_preview(data, nodata=src.nodata)
+            image = Image.fromarray(display_data, mode="L").convert("RGB")
 
+            buffer = BytesIO()
+            # Aggressive compression = much faster for large files
+            image.save(buffer, format="JPEG", quality=55, optimize=True, progressive=True)
+            preview_cache[cache_key] = buffer.getvalue()
+
+            return StreamingResponse(
+                BytesIO(preview_cache[cache_key]),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+    except Exception as error:
+        print(f"[fast-overview] Failed for {filename}: {error}")
+        raise HTTPException(status_code=500, detail=str(error))
 
 @app.get("/api/overview")
 def get_overview(
@@ -455,44 +460,39 @@ def get_overview(
     max_val: Optional[float] = Query(None),
     max_size: int = Query(600),
 ):
-    """Fast, full-extent overview used by both the viewport and minimap.
-
-    This is intentionally smaller than the normal image preview so it can
-    appear quickly after a raster is selected. It is not a native-resolution
-    image; OpenSeadragon loads native detail progressively through /api/tile.
-    """
+    """Better quality overview (still fast)."""
     file_path = validate_file_exists(filename)
-    max_size = max(128, min(int(max_size), 800))
+    max_size = max(200, min(int(max_size), 700))
     cache_key = f"overview:{filename}:{min_val}:{max_val}:{max_size}"
+
+    if cache_key in preview_cache:
+        return StreamingResponse(
+            BytesIO(preview_cache[cache_key]),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     try:
         with rasterio.open(file_path) as src:
             data = read_preview_band(src, max_size=max_size)
 
-            # IMPORTANT: do not calculate the expensive global stretch here.
-            # The overview must be fast enough to appear immediately for very
-            # large satellite rasters. Deep-zoom tiles use the global cached
-            # stretch separately, so the initial overview is only a temporary
-            # low-resolution display.
             if min_val is None or max_val is None or max_val <= min_val:
                 display_data = brighten_preview(data, nodata=src.nodata)
             else:
-                display_data = manual_or_auto_stretch(
-                    data,
-                    nodata=src.nodata,
-                    min_val=min_val,
-                    max_val=max_val,
-                )
+                display_data = manual_or_auto_stretch(data, nodata=src.nodata, min_val=min_val, max_val=max_val)
 
             image = Image.fromarray(display_data, mode="L").convert("RGB")
-            return cached_jpeg_response(cache_key, image, cache_seconds=3600)
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=70, optimize=True)
+            preview_cache[cache_key] = buffer.getvalue()
 
+            return StreamingResponse(
+                BytesIO(preview_cache[cache_key]),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to render raster overview: {str(error)}",
-        )
-
+        raise HTTPException(status_code=500, detail=str(error))
 
 @app.get("/api/rgb-overview")
 def get_rgb_overview(
@@ -507,7 +507,7 @@ def get_rgb_overview(
     b_max: Optional[float] = Query(None),
     max_size: int = Query(600),
 ):
-    """Fast, full-extent RGB overview used before deep-zoom tiles arrive."""
+    """Fast RGB overview (target < 3 s)."""
     r_path = validate_file_exists(r_file)
     g_path = validate_file_exists(g_file)
     b_path = validate_file_exists(b_file)
@@ -518,6 +518,13 @@ def get_rgb_overview(
         f"{r_min}:{r_max}:{g_min}:{g_max}:{b_min}:{b_max}:{max_size}"
     )
 
+    if cache_key in preview_cache:
+        return StreamingResponse(
+            BytesIO(preview_cache[cache_key]),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
     try:
         with (
             rasterio.open(r_path) as r_src,
@@ -526,51 +533,29 @@ def get_rgb_overview(
         ):
             out_width, out_height = preview_dimensions(r_src.width, r_src.height, max_size)
 
-            r_data = r_src.read(
-                1,
-                out_shape=(out_height, out_width),
-                resampling=Resampling.bilinear,
-                masked=True,
-            )
-            g_data = g_src.read(
-                1,
-                out_shape=(out_height, out_width),
-                resampling=Resampling.bilinear,
-                masked=True,
-            )
-            b_data = b_src.read(
-                1,
-                out_shape=(out_height, out_width),
-                resampling=Resampling.bilinear,
-                masked=True,
-            )
+            r_data = r_src.read(1, out_shape=(out_height, out_width), resampling=Resampling.bilinear, masked=True)
+            g_data = g_src.read(1, out_shape=(out_height, out_width), resampling=Resampling.bilinear, masked=True)
+            b_data = b_src.read(1, out_shape=(out_height, out_width), resampling=Resampling.bilinear, masked=True)
 
-            # Keep RGB overview fast as well. Global stretch is reserved for
-            # the tiled renderer so the first full-extent image is available
-            # quickly even for multi-gigabyte satellite rasters.
-            if r_min is None or r_max is None or r_max <= r_min:
-                red = brighten_preview(r_data, nodata=r_src.nodata)
-            else:
-                red = manual_or_auto_stretch(r_data, r_src.nodata, r_min, r_max)
-
-            if g_min is None or g_max is None or g_max <= g_min:
-                green = brighten_preview(g_data, nodata=g_src.nodata)
-            else:
-                green = manual_or_auto_stretch(g_data, g_src.nodata, g_min, g_max)
-
-            if b_min is None or b_max is None or b_max <= b_min:
-                blue = brighten_preview(b_data, nodata=b_src.nodata)
-            else:
-                blue = manual_or_auto_stretch(b_data, b_src.nodata, b_min, b_max)
+            red = brighten_preview(r_data, nodata=r_src.nodata) if (r_min is None or r_max is None or r_max <= r_min) \
+                  else manual_or_auto_stretch(r_data, r_src.nodata, r_min, r_max)
+            green = brighten_preview(g_data, nodata=g_src.nodata) if (g_min is None or g_max is None or g_max <= g_min) \
+                    else manual_or_auto_stretch(g_data, g_src.nodata, g_min, g_max)
+            blue = brighten_preview(b_data, nodata=b_src.nodata) if (b_min is None or b_max is None or b_max <= b_min) \
+                   else manual_or_auto_stretch(b_data, b_src.nodata, b_min, b_max)
 
             image = Image.fromarray(np.dstack((red, green, blue)), mode="RGB")
-            return cached_jpeg_response(cache_key, image, cache_seconds=3600)
+            buffer = BytesIO()
+            image.save(buffer, format="JPEG", quality=72, optimize=True)
+            preview_cache[cache_key] = buffer.getvalue()
 
+            return StreamingResponse(
+                BytesIO(preview_cache[cache_key]),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to render RGB overview: {str(error)}",
-        )
+        raise HTTPException(status_code=500, detail=f"RGB overview failed: {error}")
 
 
 @app.get("/api/image")
