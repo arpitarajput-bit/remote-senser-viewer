@@ -74,29 +74,22 @@ def preview_dimensions(width: int, height: int, max_size: int):
     return max(1, int(width * scale)), max(1, int(height * scale))
 
 def read_preview_band(src, band=1, max_size=PREVIEW_MAX_SIZE):
-    """Fast downsampled read – critical for large files."""
     out_width, out_height = preview_dimensions(src.width, src.height, max_size)
     return src.read(
         band,
         out_shape=(out_height, out_width),
-        resampling=Resampling.bilinear,   # faster than average for previews
+        resampling=Resampling.bilinear,
         masked=True,
     )
 
 def brighten_preview(data, nodata=None, low_percentile=2, high_percentile=98):
-    """
-    Convert raster values to uint8 with a 2-98 percentile stretch.
-    Invalid / NoData pixels remain black.
-    """
     original_mask = np.ma.getmaskarray(data)
     arr = np.asarray(np.ma.filled(data, np.nan), dtype=np.float32)
 
     valid_mask = np.isfinite(arr) & ~original_mask
-
     if nodata is not None:
         valid_mask &= arr != nodata
 
-    # Exclude zero only from the brightness calculation; preserve it as black.
     nonzero_mask = valid_mask & (arr != 0)
     valid_values = arr[nonzero_mask]
 
@@ -106,7 +99,14 @@ def brighten_preview(data, nodata=None, low_percentile=2, high_percentile=98):
     if valid_values.size == 0:
         return np.zeros(arr.shape, dtype=np.uint8)
 
-    low, high = np.percentile(valid_values, [low_percentile, high_percentile])
+    # Subsample for speed on very large arrays
+    if valid_values.size > 400_000:
+        idx = np.random.choice(valid_values.size, 150_000, replace=False)
+        sample = valid_values[idx]
+    else:
+        sample = valid_values
+
+    low, high = np.percentile(sample, [low_percentile, high_percentile])
 
     if not np.isfinite(low) or not np.isfinite(high) or high <= low:
         low = float(valid_values.min())
@@ -418,12 +418,12 @@ def get_thumbnail(filename: str = Query(...)):
 @app.get("/api/fast-overview")
 def get_fast_overview(
     filename: str = Query(...),
-    max_size: int = Query(300),
+    band: int = Query(1),
+    max_size: int = Query(240),
 ):
-    """Ultra-fast first paint for multi-GB satellite images."""
     validate_file_exists(filename)
-    max_size = max(128, min(int(max_size), 360))
-    cache_key = f"fast-overview:{filename}:{max_size}"
+    max_size = max(120, min(int(max_size), 280))
+    cache_key = f"fast-overview:{filename}:{band}:{max_size}"
 
     if cache_key in preview_cache:
         return StreamingResponse(
@@ -435,13 +435,15 @@ def get_fast_overview(
     try:
         file_path = validate_file_exists(filename)
         with rasterio.open(file_path) as src:
-            data = read_preview_band(src, max_size=max_size)
+            if band < 1 or band > src.count:
+                raise HTTPException(status_code=400, detail="Invalid band")
+
+            data = read_preview_band(src, band=band, max_size=max_size)
             display_data = brighten_preview(data, nodata=src.nodata)
             image = Image.fromarray(display_data, mode="L").convert("RGB")
 
             buffer = BytesIO()
-            # Aggressive compression = much faster for large files
-            image.save(buffer, format="JPEG", quality=55, optimize=True, progressive=True)
+            image.save(buffer, format="JPEG", quality=45, optimize=True, progressive=True)
             preview_cache[cache_key] = buffer.getvalue()
 
             return StreamingResponse(
@@ -450,20 +452,20 @@ def get_fast_overview(
                 headers={"Cache-Control": "public, max-age=86400"},
             )
     except Exception as error:
-        print(f"[fast-overview] Failed for {filename}: {error}")
+        print(f"[fast-overview] {filename} band {band}: {error}")
         raise HTTPException(status_code=500, detail=str(error))
 
 @app.get("/api/overview")
 def get_overview(
     filename: str = Query(...),
+    band: int = Query(1),
     min_val: Optional[float] = Query(None),
     max_val: Optional[float] = Query(None),
     max_size: int = Query(600),
 ):
-    """Better quality overview (still fast)."""
     file_path = validate_file_exists(filename)
     max_size = max(200, min(int(max_size), 700))
-    cache_key = f"overview:{filename}:{min_val}:{max_val}:{max_size}"
+    cache_key = f"overview:{filename}:{band}:{min_val}:{max_val}:{max_size}"
 
     if cache_key in preview_cache:
         return StreamingResponse(
@@ -474,7 +476,9 @@ def get_overview(
 
     try:
         with rasterio.open(file_path) as src:
-            data = read_preview_band(src, max_size=max_size)
+            if band < 1 or band > src.count:
+                raise HTTPException(status_code=400, detail="Invalid band")
+            data = read_preview_band(src, band=band, max_size=max_size)
 
             if min_val is None or max_val is None or max_val <= min_val:
                 display_data = brighten_preview(data, nodata=src.nodata)
@@ -644,21 +648,16 @@ def get_tile(
     z: int = Query(...),
     x: int = Query(...),
     y: int = Query(...),
+    band: int = Query(1),
     min_val: Optional[float] = Query(None),
     max_val: Optional[float] = Query(None),
 ):
-    """Serve one OpenSeadragon-compatible 256x256 raster tile.
-
-    OpenSeadragon level 0 is the lowest-resolution overview and maxLevel is
-    native resolution. A tile at level z represents 256 source pixels scaled
-    by 2**(maxLevel-z). This keeps the server pyramid aligned with the viewer
-    so the complete raster behaves like a map: fit -> zoom -> pan -> load only
-    the newly visible detail.
-    """
     file_path = validate_file_exists(filename)
 
     try:
         with rasterio.open(file_path) as src:
+            if band < 1 or band > src.count:
+                raise HTTPException(status_code=400, detail="Invalid band")
             if z < 0 or x < 0 or y < 0:
                 raise HTTPException(status_code=400, detail="Invalid tile coordinates")
 
@@ -679,15 +678,10 @@ def get_tile(
             if left >= src.width or top >= src.height or right <= left or bottom <= top:
                 return Response(status_code=204)
 
-            window = Window(
-                col_off=left,
-                row_off=top,
-                width=right - left,
-                height=bottom - top,
-            )
+            window = Window(col_off=left, row_off=top, width=right - left, height=bottom - top)
 
             data = src.read(
-                1,
+                band,
                 window=window,
                 out_shape=(TILE_SIZE, TILE_SIZE),
                 resampling=Resampling.bilinear,
@@ -695,35 +689,23 @@ def get_tile(
             )
 
             if min_val is None or max_val is None or max_val <= min_val:
-                low, high = get_global_stretch_limits(src, band=1)
-                display_data = manual_or_auto_stretch(
-                    data, src.nodata, low, high
-                )
+                low, high = get_global_stretch_limits(src, band=band)
+                display_data = manual_or_auto_stretch(data, src.nodata, low, high)
             else:
-                display_data = manual_or_auto_stretch(
-                    data, src.nodata, min_val, max_val
-                )
+                display_data = manual_or_auto_stretch(data, src.nodata, min_val, max_val)
 
             output = BytesIO()
-            Image.fromarray(display_data, mode="L").save(
-                output, format="PNG", optimize=True
-            )
+            Image.fromarray(display_data, mode="L").save(output, format="PNG", optimize=True)
 
             return Response(
                 content=output.getvalue(),
                 media_type="image/png",
-                headers={
-                    "Cache-Control": "public, max-age=3600, immutable"
-                },
+                headers={"Cache-Control": "public, max-age=3600, immutable"},
             )
-
     except HTTPException:
         raise
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to render tile: {str(error)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to render tile: {str(error)}")
 
 @app.get("/api/rgb-tile")
 def get_rgb_tile(
@@ -1010,6 +992,48 @@ def get_scatter_plot(
             detail=f"Failed to generate scatter plot: {str(error)}",
         )
 
+@app.get("/api/pixel-value")
+def get_pixel_value(
+    filename: str = Query(...),
+    x: float = Query(...),          # image column
+    y: float = Query(...),          # image row
+    band: int = Query(1),
+):
+    """Return pixel value and geographic coordinates at a given image location."""
+    file_path = validate_file_exists(filename)
+
+    try:
+        with rasterio.open(file_path) as src:
+            if band < 1 or band > src.count:
+                raise HTTPException(status_code=400, detail="Invalid band")
+
+            col = int(np.clip(x, 0, src.width - 1))
+            row = int(np.clip(y, 0, src.height - 1))
+
+            # Read single pixel
+            window = Window(col_off=col, row_off=row, width=1, height=1)
+            data = src.read(band, window=window, masked=True)
+            value = float(data[0, 0]) if data.size > 0 else None
+
+            # Geographic coordinates
+            try:
+                lon, lat = src.xy(row, col)
+            except Exception:
+                lon, lat = None, None
+
+            return {
+                "filename": filename,
+                "band": band,
+                "x": col,
+                "y": row,
+                "value": value,
+                "longitude": lon,
+                "latitude": lat,
+                "crs": str(src.crs) if src.crs else None,
+            }
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+        
 @app.get("/api/profile-plot")
 def get_profile_plot(
     filename: str = Query(...),

@@ -21,75 +21,82 @@ const computeMaxLevel = (width, height) => {
 };
 
 async function uploadFileChunked(file, containerName, onProgress) {
-  const CHUNK_SIZE = 4 * 1024 * 1024;
+  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
-  let completed = 0;
-  const indices = [...Array(totalChunks).keys()];
+  console.log(`[Upload] Starting: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB), chunks: ${totalChunks}`);
 
-  async function uploadOneChunk() {
-    while (indices.length > 0) {
-      const index = indices.shift();
-      if (index === undefined) break;
+  // Upload chunks one by one (more reliable than parallel for very large files)
+  for (let index = 0; index < totalChunks; index++) {
+    const start = index * CHUNK_SIZE;
+    const end = Math.min(file.size, start + CHUNK_SIZE);
+    const chunk = file.slice(start, end);
 
-      const start = index * CHUNK_SIZE;
-      const end = Math.min(file.size, start + CHUNK_SIZE);
-      const chunk = file.slice(start, end);
+    const formData = new FormData();
+    formData.append("file", chunk, file.name);
+    formData.append("upload_id", uploadId);
+    formData.append("chunk_index", String(index));
 
-      const formData = new FormData();
-      formData.append("file", chunk, file.name);
-      formData.append("upload_id", uploadId);
-      formData.append("chunk_index", String(index));
+    let success = false;
+    let lastError = null;
 
-      let retries = 3;
-      let success = false;
+    // Retry each chunk up to 3 times
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(`${API}/upload-chunk`, {
+          method: "POST",
+          body: formData,
+        });
 
-      while (retries > 0 && !success) {
-        try {
-          const chunkResponse = await fetch(`${API}/upload-chunk`, {
-            method: "POST",
-            body: formData,
-          });
-          if (!chunkResponse.ok) {
-            const errorText = await chunkResponse.text();
-            throw new Error(`Chunk ${index} failed: ${chunkResponse.status} ${errorText}`);
-          }
-          success = true;
-        } catch (error) {
-          retries -= 1;
-          if (retries === 0) {
-            throw new Error(`Chunk ${index} failed after retries: ${error.message}`);
-          }
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`HTTP ${res.status}: ${text}`);
+        }
+
+        success = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`[Upload] Chunk ${index} attempt ${attempt} failed:`, err.message);
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
         }
       }
-
-      completed += 1;
-      if (onProgress) onProgress(Math.round((completed / totalChunks) * 100));
     }
+
+    if (!success) {
+      throw new Error(`Failed to upload chunk ${index} after 3 retries: ${lastError?.message}`);
+    }
+
+    // Update progress
+    const percent = Math.round(((index + 1) / totalChunks) * 100);
+    if (onProgress) onProgress(percent);
   }
 
-  const workers = Array(Math.min(3, totalChunks)).fill(null).map(() => uploadOneChunk());
-  await Promise.all(workers);
+  console.log(`[Upload] All ${totalChunks} chunks uploaded. Calling upload-complete...`);
 
+  // Final assembly step
   const completeForm = new FormData();
   completeForm.append("upload_id", uploadId);
   completeForm.append("filename", file.name);
   completeForm.append("total_chunks", String(totalChunks));
   completeForm.append("container_name", containerName);
 
-  const completeResponse = await fetch(`${API}/upload-complete`, {
+  const completeRes = await fetch(`${API}/upload-complete`, {
     method: "POST",
     body: completeForm,
   });
 
-  if (!completeResponse.ok) {
-    const errorText = await completeResponse.text();
-    throw new Error(`Upload finalization failed: ${completeResponse.status} ${errorText}`);
+  if (!completeRes.ok) {
+    const text = await completeRes.text();
+    console.error(`[Upload] upload-complete failed:`, completeRes.status, text);
+    throw new Error(`Upload finalization failed: ${completeRes.status} ${text}`);
   }
 
-  return completeResponse.json();
+  const result = await completeRes.json();
+  console.log(`[Upload] Success:`, result);
+  return result;
 }
 
 export default function ImageViewer() {
@@ -176,6 +183,9 @@ export default function ImageViewer() {
   const [miniRect, setMiniRect] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const [showMinimap, setShowMinimap] = useState(true);
 
+  const [mouseInfo, setMouseInfo] = useState(null);   // {x, y, value, lon, lat}
+  const mouseInfoTimeoutRef = useRef(null);
+
   const containerRef = useRef(null);
   const imgRef = useRef(null);
   const overviewImgRef = useRef(null);
@@ -238,6 +248,24 @@ const forceCleanViewerState = () => {
   const getHistoryKey = (containerName, filename) => {
     if (!containerName || !filename) return null;
     return `image:${containerName}:${filename}`;
+  };
+
+  // Per-container "last RGB composite view" history. Keyed the same way
+  // as per-file history (getHistoryKey), just under a stable marker
+  // instead of a real filename, so a container's composite (which R/G/B
+  // bands are shown, its stretch, and its zoom/pan) can be saved and
+  // restored as its own unit — independent of whichever individual file
+  // was last clicked directly.
+  const RGB_HISTORY_MARKER = "__rgb_composite__";
+  const getRgbHistoryKey = (containerName) => getHistoryKey(containerName, RGB_HISTORY_MARKER);
+  const setRgbHistoryContext = (containerName) => {
+    const key = getRgbHistoryKey(containerName);
+    historyContextRef.current = key ? { key, containerName, baseFile: RGB_HISTORY_MARKER } : null;
+    return key;
+  };
+  const getSavedRgbHistory = (containerName) => {
+    const key = getRgbHistoryKey(containerName);
+    return key ? imageHistoryRef.current[key] || null : null;
   };
 
   const saveCurrentImageHistory = () => {
@@ -347,7 +375,48 @@ const forceCleanViewerState = () => {
     },
     [fileDisplayNames]
   );
+// Parse virtual band key: "Container1/file.tif::band3" → {filename, band}
+const parseBandKey = (key) => {
+  if (!key) return { filename: "", band: 1 };
+  if (key.includes("::band")) {
+    const [filename, bandPart] = key.split("::band");
+    return { filename, band: parseInt(bandPart, 10) || 1 };
+  }
+  return { filename: key, band: 1 };
+};
 
+// Expand a multi-band file into virtual band entries
+const expandMultiBandFile = async (containerName, filePath) => {
+  try {
+    const res = await axios.get(`${API}/metadata`, { params: { filename: filePath } });
+    const bandCount = res.data.bands || 1;
+
+    if (bandCount <= 1) return; // single-band – keep as is
+
+    const bandEntries = [];
+    const newDisplayNames = {};
+
+    for (let b = 1; b <= bandCount; b++) {
+      const bandKey = `${filePath}::band${b}`;
+      bandEntries.push(bandKey);
+      newDisplayNames[bandKey] = `${getDisplayFilename(filePath)} - Band ${b}`;
+    }
+
+    setFileDisplayNames((prev) => ({ ...prev, ...newDisplayNames }));
+
+    setContainers((prev) => {
+      const files = prev[containerName] || [];
+      // Remove the original file and add the band entries
+      const filtered = files.filter((f) => f !== filePath);
+      return {
+        ...prev,
+        [containerName]: [...filtered, ...bandEntries],
+      };
+    });
+  } catch (err) {
+    console.error("Failed to expand multi-band file:", err);
+  }
+};
   const getContainerForFile = (filename) => {
     for (const [containerName, files] of Object.entries(containers)) {
       if (files.includes(filename)) return containerName;
@@ -398,10 +467,9 @@ const waitForRasterMetadata = async (filename, attempts = 10, delayMs = 300) => 
   throw lastError || new Error("Metadata unavailable");
 };
 
-  const buildOverviewUrl = (url) => {
-    const parsed = new URL(url);
-
-    if (parsed.pathname.endsWith("/rgb-composite")) {
+ const buildOverviewUrl = (url) => {
+  const parsed = new URL(url);
+  if (parsed.pathname.endsWith("/rgb-composite")) {
       const params = new URLSearchParams({
         r_file: parsed.searchParams.get("r_file") || "",
         g_file: parsed.searchParams.get("g_file") || "",
@@ -415,17 +483,19 @@ const waitForRasterMetadata = async (filename, attempts = 10, delayMs = 300) => 
       return `${API}/rgb-overview?${params.toString()}`;
     }
 
-    const filename = parsed.searchParams.get("filename");
-    const minVal = parsed.searchParams.get("min_val");
-    const maxVal = parsed.searchParams.get("max_val");
-    const params = new URLSearchParams({
-      filename: filename || "",
-      max_size: "600",
-    });
-    if (minVal !== null && minVal !== "") params.set("min_val", minVal);
-    if (maxVal !== null && maxVal !== "") params.set("max_val", maxVal);
-    return `${API}/overview?${params.toString()}`;
-  };
+   const filename = parsed.searchParams.get("filename");
+  const band = parsed.searchParams.get("band") || "1";
+  const minVal = parsed.searchParams.get("min_val");
+  const maxVal = parsed.searchParams.get("max_val");
+  const params = new URLSearchParams({
+    filename: filename || "",
+    band: band,
+    max_size: "600",
+  });
+  if (minVal) params.set("min_val", minVal);
+  if (maxVal) params.set("max_val", maxVal);
+  return `${API}/overview?${params.toString()}`;
+};
 
 const buildFastPreviewUrl = (url) => {
   const parsed = new URL(url);
@@ -442,9 +512,10 @@ const buildFastPreviewUrl = (url) => {
     });
     return `${API}/rgb-overview?${params.toString()}`;
   }
-  const filename = parsed.searchParams.get("filename");
+ const filename = parsed.searchParams.get("filename");
+  const band = parsed.searchParams.get("band") || "1";
   if (!filename || !parsed.pathname.endsWith("/image")) return null;
-  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&max_size=300`;
+  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&band=${band}&max_size=240`;
 };
 
   // ========== IMPROVED OVERVIEW LOADER (never hangs > 10s) ==========
@@ -496,17 +567,17 @@ const loadVerifiedOverview = async (url, requestId) => {
     }
   };
 
-   // ---- Priority 1: Fast overview (must succeed under 2 s) ----
-  if (fastPreviewUrl && requestId === loadSequenceRef.current) {
-  for (let i = 0; i < 4; i++) {                 // more retries
+  // ---- Priority 1: Fast overview (critical for large files) ----
+if (fastPreviewUrl && requestId === loadSequenceRef.current) {
+  for (let i = 0; i < 5; i++) {
     if (requestId !== loadSequenceRef.current) return false;
     try {
-      // Give large files up to 3 seconds for first paint
-      const objectUrl = await tryFetchImage(fastPreviewUrl, 3000);
+      const timeout = i === 0 ? 4500 : 3000;
+      const objectUrl = await tryFetchImage(fastPreviewUrl, timeout);
       if (publishObjectUrl(objectUrl)) break;
     } catch (err) {
       lastError = err;
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 350));
     }
   }
 }
@@ -587,11 +658,12 @@ const loadVerifiedOverview = async (url, requestId) => {
       const maxLevel = computeMaxLevel(width, height);
 
       const buildRasterTileUrl = (level, x, y) => {
-        let tileUrl = `${API}/tile?filename=${encodeURIComponent(tileParams.file)}&z=${level}&x=${x}&y=${y}`;
-        if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
-        if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
-        return tileUrl;
-      };
+  const { filename, band } = parseBandKey(tileParams.file);
+  let tileUrl = `${API}/tile?filename=${encodeURIComponent(filename)}&band=${band}&z=${level}&x=${x}&y=${y}`;
+  if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
+  if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
+  return tileUrl;
+};
 
       const buildRgbTileUrl = (level, x, y) => {
         let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
@@ -919,12 +991,81 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return () => window.removeEventListener("resize", updateMini);
   }, [displayedImageUrl, rasterInfo?.width, rasterInfo?.height, isSwipeMode]);
 
-  const buildSingleImageUrl = (filename, stretch) => {
-    let url = `${API}/image?filename=${encodeURIComponent(filename)}`;
-    if (stretch && stretch.min !== "" && stretch.min != null) url += `&min_val=${encodeURIComponent(stretch.min)}`;
-    if (stretch && stretch.max !== "" && stretch.max != null) url += `&max_val=${encodeURIComponent(stretch.max)}`;
-    return url;
+  const buildSingleImageUrl = (fileKey, stretch) => {
+  const { filename, band } = parseBandKey(fileKey);
+  let url = `${API}/image?filename=${encodeURIComponent(filename)}&band=${band}`;
+  if (stretch && stretch.min !== "" && stretch.min != null) url += `&min_val=${encodeURIComponent(stretch.min)}`;
+  if (stretch && stretch.max !== "" && stretch.max != null) url += `&max_val=${encodeURIComponent(stretch.max)}`;
+  return url;
+};
+
+// ========== PIXEL VALUE + COORDINATES ==========
+useEffect(() => {
+  if (isSwipeMode || !osdReady) {
+    setMouseInfo(null);
+    return;
+  }
+
+  const surface = osdContainerRef.current;
+  if (!surface || !viewerRef.current) return;
+
+  const handleMouseMove = (e) => {
+    const viewer = viewerRef.current;
+    if (!viewer?.viewport) return;
+
+    const rect = surface.getBoundingClientRect();
+    const pixel = new OpenSeadragon.Point(
+      e.clientX - rect.left,
+      e.clientY - rect.top
+    );
+
+    // Convert to image coordinates
+    const imagePoint = viewer.viewport.viewerElementToImageCoordinates(pixel);
+    const imgX = Math.round(imagePoint.x);
+    const imgY = Math.round(imagePoint.y);
+
+    // Debounce the API call
+    if (mouseInfoTimeoutRef.current) {
+      clearTimeout(mouseInfoTimeoutRef.current);
+    }
+
+    mouseInfoTimeoutRef.current = setTimeout(async () => {
+      // Decide which file + band to query
+      let fileKey = selectedFile || rFile || activeFilesPool[0];
+      if (!fileKey) return;
+
+      const { filename, band } = parseBandKey(fileKey);
+
+      try {
+        const res = await axios.get(`${API}/pixel-value`, {
+          params: { filename, x: imgX, y: imgY, band },
+          timeout: 2000,
+        });
+        setMouseInfo(res.data);
+      } catch (err) {
+        // silent fail
+      }
+    }, 80); // small debounce
   };
+
+  const handleMouseLeave = () => {
+    setMouseInfo(null);
+    if (mouseInfoTimeoutRef.current) {
+      clearTimeout(mouseInfoTimeoutRef.current);
+    }
+  };
+
+  surface.addEventListener("mousemove", handleMouseMove);
+  surface.addEventListener("mouseleave", handleMouseLeave);
+
+  return () => {
+    surface.removeEventListener("mousemove", handleMouseMove);
+    surface.removeEventListener("mouseleave", handleMouseLeave);
+    if (mouseInfoTimeoutRef.current) {
+      clearTimeout(mouseInfoTimeoutRef.current);
+    }
+  };
+}, [isSwipeMode, osdReady, selectedFile, rFile, activeFilesPool]);
 
   const buildCompositeUrl = (r, g, b, stretch) => {
     let url = `${API}/rgb-composite?r_file=${encodeURIComponent(r)}&g_file=${encodeURIComponent(g)}&b_file=${encodeURIComponent(b)}`;
@@ -1057,13 +1198,30 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     setHistSelectedChannel(null);
     rgbBeforeHistRef.current = null;
 
+    // Preserve the current zoom/pan across the reload — clearing the
+    // stretch should only change brightness/contrast, not reset where
+    // you're looking. Every other stretch/band-change handler already
+    // captures this; this one was the one place that didn't.
+    let currentViewport = null;
+    if (viewerRef.current?.viewport) {
+      try {
+        const vp = viewerRef.current.viewport;
+        const center = vp.getCenter();
+        currentViewport = {
+          osdZoom: vp.getZoom(),
+          osdCenter: { x: center.x, y: center.y },
+        };
+      } catch (_) {}
+    }
+
     if (rFile && gFile && bFile) {
       setViewMode("rgb");
       setSelectedFile(null);
       loadImage(
         buildCompositeUrl(rFile, gFile, bFile, noStretch),
         compositeViewKey(rFile, gFile, bFile),
-        false
+        true,
+        currentViewport
       );
       return;
     }
@@ -1074,7 +1232,8 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       loadImage(
         buildSingleImageUrl(fileToRestore, noStretch.default),
         rasterViewKey(fileToRestore),
-        true
+        true,
+        currentViewport
       );
     }
   };
@@ -1147,27 +1306,41 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return;
   }
 
-  // Rebuild RGB with remaining files
-  const r = remainingFiles[0];
-  const g = remainingFiles[1] || remainingFiles[0];
-  const b = remainingFiles[2] || g;
+  // Keep whichever of the current R/G/B slots are still valid; only the
+  // slot(s) that pointed at the deleted file get replaced with another
+  // available band from the container. This avoids resetting bands the
+  // user already had selected just because one other band was deleted.
+  const currentAssignment = containerRgbRef.current[containerName] || { r: rFile, g: gFile, b: bFile };
+  const pickReplacement = (exclude) =>
+    remainingFiles.find((f) => !exclude.includes(f)) || remainingFiles[0];
+
+  let r = currentAssignment.r && currentAssignment.r !== deletedFilename && remainingFiles.includes(currentAssignment.r)
+    ? currentAssignment.r : null;
+  let g = currentAssignment.g && currentAssignment.g !== deletedFilename && remainingFiles.includes(currentAssignment.g)
+    ? currentAssignment.g : null;
+  let b = currentAssignment.b && currentAssignment.b !== deletedFilename && remainingFiles.includes(currentAssignment.b)
+    ? currentAssignment.b : null;
+
+  if (!r) r = pickReplacement([g, b].filter(Boolean));
+  if (!g) g = pickReplacement([r, b].filter(Boolean));
+  if (!b) b = pickReplacement([r, g].filter(Boolean));
 
   setRFile(r);
   setGFile(g);
   setBFile(b);
   setSelectedFile(null);
   setViewMode("rgb");
+  setRgbHistoryContext(containerName);
 
   containerRgbRef.current[containerName] = { r, g, b };
 
-  const noStretch = createEmptyStretchValues();
-  setStretchValues(noStretch);
-  containerStretchRef.current[containerName] = noStretch;
-
+  // Keep the existing stretch instead of wiping it — a deletion swapping
+  // one band shouldn't discard contrast stretching the user already set
+  // up on the composite (stretch is only cleared via the Reset button).
   loadImage(
-    buildCompositeUrl(r, g, b, noStretch),
+    buildCompositeUrl(r, g, b, stretchValues),
     compositeViewKey(r, g, b),
-    false
+    true
   );
 
   axios
@@ -1210,46 +1383,67 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
   };
 
   const processUploadsToContainer = async (targetContainerName, filesToUpload) => {
-    setShowContainerModal(false);
+  setShowContainerModal(false);
 
-    for (const file of filesToUpload) {
-      const storedFilePath = `${targetContainerName}/${file.name}`;
+  for (const file of filesToUpload) {
+    const storedFilePath = `${targetContainerName}/${file.name}`;
 
-      setContainers((prev) => {
-        const existingFiles = prev[targetContainerName] || [];
-        if (existingFiles.includes(storedFilePath)) return prev;
+    // Prevent duplicates
+    if ((containers[targetContainerName] || []).includes(storedFilePath)) {
+      showToast(`${file.name} already exists in ${targetContainerName}`, "error");
+      continue;
+    }
 
-        const updatedFiles = [...existingFiles, storedFilePath];
-        return { ...prev, [targetContainerName]: updatedFiles };
+    // Add to UI immediately
+    setContainers((prev) => {
+      const existing = prev[targetContainerName] || [];
+      if (existing.includes(storedFilePath)) return prev;
+      return {
+        ...prev,
+        [targetContainerName]: [...existing, storedFilePath],
+      };
+    });
+
+    setFileDisplayNames((prev) => ({
+      ...prev,
+      [storedFilePath]: file.name,
+    }));
+
+    try {
+      setIsUploading(true);
+      setUploadProgress(0);
+
+      await uploadFileChunked(file, targetContainerName, (percent) => {
+        setUploadProgress(percent);
       });
 
-      setFileDisplayNames((prev) => ({ ...prev, [storedFilePath]: file.name }));
-    }
+      setActiveContainer(targetContainerName);
+      setActiveRgbContainer(targetContainerName);
 
-    for (const file of filesToUpload) {
-      const storedFilePath = `${targetContainerName}/${file.name}`;
-
-      try {
-        const result = await uploadFileChunked(file, targetContainerName, (percent) => {
-          setUploadProgress(percent);
-        });
-
-        setActiveContainer(targetContainerName);
-        setActiveRgbContainer(targetContainerName);
-
-      } catch (error) {
-        console.error("Upload failed:", error);
-        showToast(`Upload failed for ${file.name}: ${error.message}`, "error");
-
-        setContainers((prev) => {
-          const updatedFiles = (prev[targetContainerName] || []).filter(f => f !== storedFilePath);
-          return { ...prev, [targetContainerName]: updatedFiles };
-        });
-        break;
+      // Expand multi-band if needed
+      if (typeof expandMultiBandFile === "function") {
+        await expandMultiBandFile(targetContainerName, storedFilePath);
       }
+
+      showToast(`${file.name} uploaded successfully`, "success");
+
+    } catch (error) {
+      console.error("Upload failed:", error);
+      showToast(`Upload failed for ${file.name}: ${error.message}`, "error");
+
+      // Remove from sidebar if upload failed
+      setContainers((prev) => {
+        const updated = (prev[targetContainerName] || []).filter((f) => f !== storedFilePath);
+        return { ...prev, [targetContainerName]: updated };
+      });
+    } finally {
+      setIsUploading(false);
+      setUploadProgress(0);
     }
-    setPendingFiles([]);
-  };
+  }
+
+  setPendingFiles([]);
+};
 
   const handleDeleteContainer = (containerName) => {
     if (!window.confirm(`Delete entire container "${containerName}" and all its rasters?`)) return;
@@ -1530,20 +1724,22 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     }
   };
 
-  const fetchHistogramFor = async (filename, setLoading, setData) => {
-    if (!filename) return;
-    setLoading(true);
-    try {
-      const res = await axios.get(`${API}/histogram`, { params: { filename, band: 1, bins: 32 } });
-      setData(res.data);
-    } catch (err) {
-      console.error("Histogram error:", err);
-      showToast("Failed to fetch histogram data.", "error");
-    } finally {
-      setLoading(false);
-    }
-  };
-
+const fetchHistogramFor = async (fileKey, setLoading, setData) => {
+  if (!fileKey) return;
+  const { filename, band } = parseBandKey(fileKey);
+  setLoading(true);
+  try {
+    const res = await axios.get(`${API}/histogram`, {
+      params: { filename, band, bins: 32 },
+    });
+    setData(res.data);
+  } catch (err) {
+    console.error("Histogram error:", err);
+    showToast("Failed to fetch histogram data.", "error");
+  } finally {
+    setLoading(false);
+  }
+};
   const fetchChannelHistogram = (filename, channel) => {
     const setLoading =
       channel === "r" ? setHistRLoading :
@@ -1556,6 +1752,7 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
   
 const handleRGBChange = (channel, value) => {
   if (isSwipeMode) return;
+  saveCurrentImageHistory();
 
   // Save current zoom & pan before changing
   let currentViewport = null;
@@ -1584,6 +1781,7 @@ const handleRGBChange = (channel, value) => {
   if (nextR && nextG && nextB) {
     setSelectedFile(null);
     setViewMode("rgb");
+    if (activeContainer) setRgbHistoryContext(activeContainer);
 
     // Keep current stretch values
     const currentStretch = stretchValues;
@@ -1759,6 +1957,53 @@ const handleRGBChange = (channel, value) => {
     };
   }, []);
 
+  useEffect(() => {
+  if (!isProfileMode || isSwipeMode) return;
+
+  const surface = osdContainerRef.current;
+  if (!surface || !viewerRef.current) return;
+
+  const handleClick = (e) => {
+    const viewer = viewerRef.current;
+    if (!viewer?.viewport) return;
+
+    const rect = surface.getBoundingClientRect();
+    const pixel = new OpenSeadragon.Point(
+      e.clientX - rect.left,
+      e.clientY - rect.top
+    );
+
+    const imagePoint = viewer.viewport.viewerElementToImageCoordinates(pixel);
+    const point = {
+      x: Math.round(imagePoint.x),
+      y: Math.round(imagePoint.y),
+    };
+
+    if (!profileStart) {
+      setProfileStart(point);
+      showToast("Start point set. Now click the end point.", "success");
+    } else {
+      setProfileEnd(point);
+      setIsProfileMode(false);
+
+      const fileToUse = profileFile || selectedFile || rFile || (activeFilesPool[0] || "");
+      if (fileToUse) {
+        fetchProfilePlot(profileStart, point, fileToUse, selectedProfileBand);
+      } else {
+        showToast("No file selected for profile.", "error");
+      }
+    }
+  };
+
+  surface.style.cursor = "crosshair";
+  surface.addEventListener("click", handleClick);
+
+  return () => {
+    surface.removeEventListener("click", handleClick);
+    surface.style.cursor = "grab";
+  };
+}, [isProfileMode, profileStart, profileFile, selectedFile, rFile, activeFilesPool, selectedProfileBand]);
+
   const openHistogramModal = () => {
     if (activeFilesPool.length === 0 && allFilesList.length === 0) {
       return showToast("No files in active container. Select a container first.", "error");
@@ -1845,23 +2090,23 @@ const handleRGBChange = (channel, value) => {
   };
 
   const openProfilePlotModal = () => {
-    if (activeFilesPool.length === 0) {
-      return showToast("No files in active container. Select a container first.", "error");
-    }
+  if (activeFilesPool.length === 0) {
+    return showToast("No files in active container.", "error");
+  }
 
-    let defaultFile = rFile || activeFilesPool[0];
-    if (!defaultFile) defaultFile = activeFilesPool[0];
+  const defaultFile = selectedFile || rFile || activeFilesPool[0];
+  setProfileFile(defaultFile);
+  setSelectedProfileBand(1);
+  setProfileStart(null);
+  setProfileEnd(null);
 
-    setProfileFile(defaultFile);
-    setSelectedProfileBand(1);
+  setShowHistogram(false);
+  setShowScatterPlot(false);
+  setShowProfileModal(false);
+  setIsProfileMode(true);
 
-    setShowHistogram(false);
-    setShowScatterPlot(false);
-    setShowProfileModal(false);
-    setIsProfileMode(true);
-
-    showToast("Click start and end points on the image.", "success");
-  };
+  showToast("Click two points on the image to draw the profile line.", "success");
+};
 
   const fetchProfilePlot = async (pStart, pEnd, filename, band = 1) => {
     if (!filename || !pStart || !pEnd) return;
@@ -2141,21 +2386,46 @@ const handleRGBChange = (channel, value) => {
   setShowHistogram(false);
 
   const filesInContainer = containers[containerName] || [];
-
   if (filesInContainer.length === 0) return;
 
-  // Auto set RGB according to number of files
-  let r, g, b;
-  if (filesInContainer.length === 1) {
-    r = g = b = filesInContainer[0];
-  } else if (filesInContainer.length === 2) {
-    r = filesInContainer[0];
-    g = filesInContainer[1];
-    b = filesInContainer[1];          // repeat the second
+  const saved = getSavedRgbHistory(containerName);
+  setRgbHistoryContext(containerName);
+
+  const savedCombo = saved && saved.rFile && saved.gFile && saved.bFile &&
+    filesInContainer.includes(saved.rFile) &&
+    filesInContainer.includes(saved.gFile) &&
+    filesInContainer.includes(saved.bFile)
+    ? saved
+    : null;
+
+  let r, g, b, stretchToUse, restoreViewport;
+
+  if (savedCombo) {
+    // Restore exactly the R/G/B bands, stretch, and zoom/pan this
+    // container's composite had the last time it was viewed — this is
+    // the fix: previously every click here reset to files[0..2] with no
+    // stretch and no zoom/pan restore, no matter what was saved.
+    r = savedCombo.rFile;
+    g = savedCombo.gFile;
+    b = savedCombo.bFile;
+    stretchToUse = cloneStretchValues(savedCombo.stretchValues);
+    restoreViewport = savedCombo;
   } else {
-    r = filesInContainer[0];
-    g = filesInContainer[1];
-    b = filesInContainer[2];
+    // First time viewing this container's composite — default to the
+    // first three (or fewer) files, with no stretch applied yet.
+    if (filesInContainer.length === 1) {
+      r = g = b = filesInContainer[0];
+    } else if (filesInContainer.length === 2) {
+      r = filesInContainer[0];
+      g = filesInContainer[1];
+      b = filesInContainer[1];
+    } else {
+      r = filesInContainer[0];
+      g = filesInContainer[1];
+      b = filesInContainer[2];
+    }
+    stretchToUse = createEmptyStretchValues();
+    restoreViewport = null;
   }
 
   setRFile(r);
@@ -2163,16 +2433,15 @@ const handleRGBChange = (channel, value) => {
   setBFile(b);
   setSelectedFile(null);
   setViewMode("rgb");
+  setStretchValues(stretchToUse);
 
   containerRgbRef.current[containerName] = { r, g, b };
 
-  const noStretch = createEmptyStretchValues();
-  setStretchValues(noStretch);
-
   loadImage(
-    buildCompositeUrl(r, g, b, noStretch),
+    buildCompositeUrl(r, g, b, stretchToUse),
     compositeViewKey(r, g, b),
-    false
+    true,
+    restoreViewport
   );
 }}
                   >
@@ -2553,111 +2822,4 @@ const handleRGBChange = (channel, value) => {
       {showProfileModal && (
         <div style={{ ...styles.sidePanel, right: showHistogram ? "360px" : 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-            <h3 style={{ margin: 0, fontSize: "14px", color: "#f8fafc" }}>Raster Cross-Section Profile</h3>
-            <button style={{ background: "none", border: "none", color: "#94a3b8", cursor: "pointer" }} onClick={() => setShowProfileModal(false)}>✕</button>
-          </div>
-          <div style={{ display: "flex", gap: "8px", marginBottom: "16px", alignItems: "center" }}>
-            <label style={{ fontSize: "11px", color: "#94a3b8" }}>Layer/Band:</label>
-            <select value={profileFile} onChange={(e) => { const f = e.target.value; setProfileFile(f); if (profileStart && profileEnd) fetchProfilePlot(profileStart, profileEnd, f, selectedProfileBand); }} style={{ ...styles.selectInput, flex: 1 }}>
-              {activeFilesPool.map((f) => <option key={`pf-${f}`} value={f}>{getDisplayName(f)}</option>)}
-            </select>
-            {isProfileLoading && <span style={styles.inlineSpinner} />}
-          </div>
-          {isProfileLoading ? (
-            <div style={{ textAlign: "center", padding: "40px", color: "#94a3b8", fontSize: "12px" }}>Calculating profile slice...</div>
-          ) : profileData && profileData.values ? (
-            <div>
-              <div style={{ display: "flex", alignItems: "flex-end", height: "130px", gap: "2px", borderBottom: "1px solid #2a2d34", paddingBottom: "2px", marginBottom: "8px" }}>
-                {profileData.values.map((val, idx) => {
-                  const min = profileData.min;
-                  const max = profileData.max === min ? min + 1 : profileData.max;
-                  const pct = Math.max(Math.min(Math.round(((val - min) / (max - min)) * 100), 100), 2);
-                  return (
-                    <div key={idx} title={`Value: ${val.toFixed(2)}`} style={{ flex: 1, height: "100%", display: "flex", alignItems: "flex-end" }}>
-                      <div style={{ width: "100%", height: `${pct}%`, backgroundColor: "#10b981", borderRadius: "1px 1px 0 0" }} />
-                    </div>
-                  );
-                })}
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "#64748b", marginBottom: "16px" }}>
-                <span>Start (Distance 0)</span><span>End (Distance Max)</span>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "6px", fontSize: "11px", color: "#94a3b8", background: "#14171d", padding: "8px", borderRadius: "4px", border: "1px solid #1e222d" }}>
-                <div>Min: {profileData.min.toFixed(2)}</div>
-                <div>Max: {profileData.max.toFixed(2)}</div>
-              </div>
-            </div>
-          ) : (
-            <div style={{ color: "#ef4444", fontSize: "12px" }}>No profile data found</div>
-          )}
-        </div>
-      )}
-
-      {toast && (
-        <div style={{ ...styles.toast, ...(toast.type === "success" ? styles.toastSuccess : styles.toastError) }}>
-          {toast.message}
-        </div>
-      )}
-
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-    </div>
-  );
-}
-
-const styles = {
-  appContainer: { display: "flex", height: "100vh", width: "100vw", backgroundColor: "#0b0d11", color: "#e2e8f0", fontFamily: "Inter, sans-serif", userSelect: "none", overflow: "hidden" },
-  sidebar: { width: "280px", borderRight: "1px solid #1e222d", padding: "16px", display: "flex", flexDirection: "column", backgroundColor: "#0f1219", flexShrink: 0 },
-  sidebarHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "20px" },
-  sidebarTitle: { margin: 0, fontSize: "18px", fontWeight: "700", color: "#f8fafc" },
-  versionBadge: { fontSize: "11px", background: "#1e293b", color: "#94a3b8", padding: "2px 6px", borderRadius: "4px" },
-  uploadBtn: { display: "flex", alignItems: "center", justifyContent: "center", background: "#2563eb", color: "#ffffff", padding: "10px", borderRadius: "6px", fontWeight: "600", fontSize: "13px", cursor: "pointer", marginBottom: "20px" },
-  uploadProgressContainer: { marginBottom: "16px" },
-  progressText: { fontSize: "11px", color: "#94a3b8", marginBottom: "4px" },
-  progressBarBg: { background: "#1e293b", height: "4px", borderRadius: "2px", overflow: "hidden" },
-  progressBarFill: { background: "#22c55e", height: "100%" },
-  sectionHeader: { fontSize: "12px", fontWeight: "600", textTransform: "uppercase", color: "#64748b", marginBottom: "12px", display: "flex", justifyContent: "space-between" },
-  badge: { background: "#1e293b", color: "#94a3b8", padding: "1px 6px", borderRadius: "10px", fontSize: "10px" },
-  rasterList: { display: "flex", flexDirection: "column", gap: "12px", overflowY: "auto", flex: 1 },
-  containerGroup: { display: "flex", flexDirection: "column", gap: "6px", border: "1px solid #1e222d", borderRadius: "6px", padding: "6px", cursor: "pointer", transition: "all 0.15s ease" },
-  containerHeaderBar: { fontSize: "11px", fontWeight: "700", color: "#38bdf8", textTransform: "uppercase", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px" },
-  emptyStateText: { fontSize: "12px", color: "#475569", textAlign: "center", marginTop: "20px", fontStyle: "italic" },
-  rasterCard: { display: "grid", gridTemplateColumns: "42px 1fr 26px", alignItems: "center", gap: "12px", padding: "10px", borderWidth: "1px", borderStyle: "solid", borderRadius: "6px", cursor: "pointer" },
-  thumbnail: { width: "42px", height: "42px", objectFit: "cover", borderRadius: "4px", border: "1px solid #2a2d34" },
-  rasterInfoText: { overflow: "hidden", minWidth: 0 },
-  rasterName: { fontSize: "13px", fontWeight: "600", color: "#f1f5f9", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
-  rasterSubtext: { fontSize: "11px", color: "#64748b", marginTop: "2px" },
-  deleteBtn: { background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: "14px" },
-  mainContent: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0 },
-  toolbar: { minHeight: "68px", backgroundColor: "#0f1219", borderBottom: "1px solid #1e222d", display: "flex", alignItems: "center", padding: "8px 20px", gap: "16px", overflowX: "auto" },
-  toolGroup: { display: "flex", flexDirection: "column", gap: "6px", flexShrink: 0, position: "relative" },
-  groupLabel: { fontSize: "10px", fontWeight: "600", textTransform: "uppercase", color: "#64748b" },
-  btnRow: { display: "flex", alignItems: "center", gap: "10px" },
-  iconBtn: { background: "#1e222d", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "6px 12px", borderRadius: "5px", fontSize: "12px", cursor: "pointer", display: "flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" },
-  selectInput: { background: "#14171d", color: "#f8fafc", border: "1px solid #2a2d34", padding: "5px 8px", borderRadius: "5px", fontSize: "12px", outline: "none", cursor: "pointer" },
-  selectPair: { display: "flex", alignItems: "center", gap: "4px" },
-  stretchBtn: { background: "#1e293b", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "4px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap" },
-  stretchInput: { background: "#0b0d11", color: "#f8fafc", border: "1px solid #2a2d34", padding: "5px 8px", borderRadius: "5px", fontSize: "11px", outline: "none", width: "50%" },
-  inlineSpinner: { width: "12px", height: "12px", border: "2px solid #38bdf8", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 },
-  divider: { width: "1px", height: "36px", backgroundColor: "#1e222d", flexShrink: 0 },
-  metaStrip: { height: "32px", backgroundColor: "#0b0d11", borderBottom: "1px solid #1e222d", display: "flex", alignItems: "center", padding: "0 20px", gap: "20px", fontSize: "12px", color: "#94a3b8", flexShrink: 0 },
-  viewport: { flex: 1, position: "relative", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: "#07090c" },
-  rasterImageStyle: { position: "absolute", maxWidth: "none", maxHeight: "none", pointerEvents: "none", display: "block" },
-  placeholder: { color: "#475569", fontSize: "14px", fontStyle: "italic" },
-  loadingBadge: { position: "absolute", bottom: "20px", right: "20px", backgroundColor: "#0f1219", border: "1px solid #1e222d", padding: "8px 16px", borderRadius: "6px", display: "flex", alignItems: "center", gap: "10px", fontSize: "12px", color: "#f8fafc", boxShadow: "0 4px 12px rgba(0,0,0,0.5)", zIndex: 10 },
-  spinnerSmall: { width: "14px", height: "14px", border: "2px solid #38bdf8", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" },
-  toast: { position: "fixed", bottom: "24px", left: "50%", transform: "translateX(-50%)", padding: "10px 20px", borderRadius: "6px", fontSize: "13px", fontWeight: "500", zIndex: 2000, boxShadow: "0 4px 12px rgba(0,0,0,0.5)" },
-  toastSuccess: { backgroundColor: "#065f46", color: "#d1fae5", border: "1px solid #059669" },
-  toastError: { backgroundColor: "#991b1b", color: "#fee2e2", border: "1px solid #dc2626" },
-  modalBackdrop: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3000 },
-  modalBox: { backgroundColor: "#0f1219", border: "1px solid #1e222d", borderRadius: "8px", padding: "24px", width: "360px", boxShadow: "0 8px 24px rgba(0,0,0,0.6)" },
-  sidePanel: { position: "fixed", top: 0, right: 0, bottom: 0, width: "360px", backgroundColor: "#0f1219", borderLeft: "1px solid #1e222d", boxShadow: "-8px 0 24px rgba(0,0,0,0.5)", zIndex: 900, overflowY: "auto", padding: "20px" },
-  histPanel: { position: "fixed", top: 0, right: 0, bottom: 0, width: "360px", backgroundColor: "#0f1219", borderLeft: "1px solid #1e222d", boxShadow: "-8px 0 24px rgba(0,0,0,0.5)", zIndex: 900, overflowY: "auto", padding: "20px" },
-  modalTitle: { margin: "0 0 8px 0", fontSize: "16px", fontWeight: "700", color: "#f8fafc" },
-  modalSubtitle: { margin: "0 0 16px 0", fontSize: "12px", color: "#94a3b8" },
-  modalContainerList: { display: "flex", flexDirection: "column", gap: "8px", marginBottom: "16px" },
-  modalOptionBtn: { background: "#14171d", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "10px 14px", borderRadius: "6px", fontSize: "13px", fontWeight: "600", textAlign: "left", cursor: "pointer" },
-  modalCancelBtn: { background: "transparent", border: "1px solid #2a2d34", color: "#94a3b8", padding: "8px", borderRadius: "6px", fontSize: "12px", width: "100%", cursor: "pointer" },
-  minimapContainer: { position: "absolute", right: "18px", bottom: "18px", width: "300px", height: "220px", border: "1px solid rgba(255,255,255,0.06)", borderRadius: "6px", overflow: "hidden", background: "#0b0d11", boxShadow: "0 6px 18px rgba(0,0,0,0.6)", zIndex: 1200, cursor: "pointer" },
-  minimapImage: { width: "100%", height: "100%", objectFit: "contain", objectPosition: "center", transform: "scale(1)", display: "block", backgroundColor: "#0b0d11" },
-  miniViewportRect: { position: "absolute", border: "2px solid rgba(59,130,246,0.9)", boxSizing: "border-box", pointerEvents: "none", backgroundColor: "rgba(59,130,246,0.08)" },
-};
+    
