@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import axios from "axios";
 import OpenSeadragon from "openseadragon";
+import { fromBlob } from "geotiff";
 
 const getApiUrl = () => {
   if (typeof window !== "undefined" && window.location.hostname.includes("github.dev")) {
@@ -12,8 +13,7 @@ const getApiUrl = () => {
 };
 
 const API = getApiUrl();
-
-const TILE_SIZE = 256;
+const TILE_SIZE = 512;
 
 const computeMaxLevel = (width, height) => {
   const maxDim = Math.max(width, height, 1);
@@ -21,82 +21,123 @@ const computeMaxLevel = (width, height) => {
 };
 
 async function uploadFileChunked(file, containerName, onProgress) {
-  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB chunks
+  // Small requests are more reliable through the GitHub Codespaces proxy.
+  // Upload happens in the background, so the UI never waits for this step.
+  const CHUNK_SIZE = 2 * 1024 * 1024;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   const uploadId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const CONCURRENCY = 4;
+  const completed = new Set();
 
-  console.log(`[Upload] Starting: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB), chunks: ${totalChunks}`);
+  console.log(`[Upload] ${file.name} – ${(file.size / 1024 / 1024).toFixed(1)} MB – ${totalChunks} chunks`);
 
-  // Upload chunks one by one (more reliable than parallel for very large files)
-  for (let index = 0; index < totalChunks; index++) {
-    const start = index * CHUNK_SIZE;
-    const end = Math.min(file.size, start + CHUNK_SIZE);
-    const chunk = file.slice(start, end);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= totalChunks) return;
+      const start = index * CHUNK_SIZE;
+      const end = Math.min(file.size, start + CHUNK_SIZE);
+      const chunk = file.slice(start, end);
+      let lastError = null;
 
-    const formData = new FormData();
-    formData.append("file", chunk, file.name);
-    formData.append("upload_id", uploadId);
-    formData.append("chunk_index", String(index));
-
-    let success = false;
-    let lastError = null;
-
-    // Retry each chunk up to 3 times
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const res = await fetch(`${API}/upload-chunk`, {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(`HTTP ${res.status}: ${text}`);
-        }
-
-        success = true;
-        break;
-      } catch (err) {
-        lastError = err;
-        console.warn(`[Upload] Chunk ${index} attempt ${attempt} failed:`, err.message);
-        if (attempt < 3) {
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          const formData = new FormData();
+          formData.append("file", chunk, file.name);
+          formData.append("upload_id", uploadId);
+          formData.append("chunk_index", String(index));
+          const res = await fetch(`${API}/upload-chunk`, { method: "POST", body: formData });
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+          completed.add(index);
+          if (onProgress) onProgress(Math.round((completed.size / totalChunks) * 100));
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(5000, 500 * attempt)));
         }
       }
+      if (!completed.has(index)) throw new Error(`Chunk ${index} failed: ${lastError?.message || "unknown error"}`);
     }
+  };
 
-    if (!success) {
-      throw new Error(`Failed to upload chunk ${index} after 3 retries: ${lastError?.message}`);
-    }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, totalChunks) }, worker));
 
-    // Update progress
-    const percent = Math.round(((index + 1) / totalChunks) * 100);
-    if (onProgress) onProgress(percent);
-  }
-
-  console.log(`[Upload] All ${totalChunks} chunks uploaded. Calling upload-complete...`);
-
-  // Final assembly step
   const completeForm = new FormData();
   completeForm.append("upload_id", uploadId);
   completeForm.append("filename", file.name);
   completeForm.append("total_chunks", String(totalChunks));
   completeForm.append("container_name", containerName);
+  const completeRes = await fetch(`${API}/upload-complete`, { method: "POST", body: completeForm });
+  if (!completeRes.ok) throw new Error(`upload-complete failed: ${completeRes.status} ${await completeRes.text()}`);
+  return await completeRes.json();
+}
 
-  const completeRes = await fetch(`${API}/upload-complete`, {
-    method: "POST",
-    body: completeForm,
+async function createLocalGeoTiffPreview(file, maxSize = 640) {
+  const tiff = await fromBlob(file);
+  const image = await tiff.getImage();
+  const width = image.getWidth();
+  const height = image.getHeight();
+  const scale = Math.min(1, maxSize / Math.max(width, height));
+  const outWidth = Math.max(1, Math.round(width * scale));
+  const outHeight = Math.max(1, Math.round(height * scale));
+
+  const rasters = await image.readRasters({
+    samples: [0],
+    width: outWidth,
+    height: outHeight,
+    interleave: false,
   });
+  const data = rasters[0];
 
-  if (!completeRes.ok) {
-    const text = await completeRes.text();
-    console.error(`[Upload] upload-complete failed:`, completeRes.status, text);
-    throw new Error(`Upload finalization failed: ${completeRes.status} ${text}`);
+    // Better brightness – use 2% / 98% percentiles (same as backend)
+  const samples = [];
+  const step = Math.max(1, Math.floor(data.length / 80000));
+  for (let i = 0; i < data.length; i += step) {
+    const v = Number(data[i]);
+    if (Number.isFinite(v) && v !== 0) samples.push(v);
+  }
+  let min = 0, max = 1;
+  if (samples.length > 0) {
+    samples.sort((a, b) => a - b);
+    const lowIdx = Math.floor(samples.length * 0.02);
+    const highIdx = Math.floor(samples.length * 0.98);
+    min = samples[lowIdx];
+    max = samples[highIdx];
+    if (max <= min) {
+      min = samples[0];
+      max = samples[samples.length - 1];
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+    min = 0;
+    max = 1;
   }
 
-  const result = await completeRes.json();
-  console.log(`[Upload] Success:`, result);
-  return result;
+  const canvas = document.createElement("canvas");
+  canvas.width = outWidth;
+  canvas.height = outHeight;
+  const ctx = canvas.getContext("2d", { willReadFrequently: false });
+  const rgba = ctx.createImageData(outWidth, outHeight);
+  for (let i = 0; i < data.length; i++) {
+    const v = Number(data[i]);
+    const normalized = Number.isFinite(v) ? Math.max(0, Math.min(255, ((v - min) * 255) / (max - min))) : 0;
+    const j = i * 4;
+    rgba.data[j] = normalized;
+    rgba.data[j + 1] = normalized;
+    rgba.data[j + 2] = normalized;
+    rgba.data[j + 3] = 255;
+  }
+  ctx.putImageData(rgba, 0, 0);
+  const blob = await new Promise((resolve, reject) => canvas.toBlob((b) => b ? resolve(b) : reject(new Error("Could not create preview")), "image/jpeg", 0.78));
+  return {
+    url: URL.createObjectURL(blob),
+    width,
+    height,
+    bands: image.getSamplesPerPixel() || 1,
+    stretchMin: min,
+    stretchMax: max,
+  };
 }
 
 export default function ImageViewer() {
@@ -165,8 +206,6 @@ export default function ImageViewer() {
   const [swipeLeftLoading, setSwipeLeftLoading] = useState(false);
   const [swipeRightLoading, setSwipeRightLoading] = useState(false);
 
-  const [chunkImages, setChunkImages] = useState({});
-  const [loadingChunks, setLoadingChunks] = useState([]);
   const [imageUrl, setImageUrl] = useState("");
   const [displayedImageUrl, setDisplayedImageUrl] = useState("");
   const [isImageLoading, setIsImageLoading] = useState(false);
@@ -177,18 +216,16 @@ export default function ImageViewer() {
 
   const [scale, setScale] = useState(1);
   const [position, setPosition] = useState({ x: 0, y: 0 });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
   const [miniRect, setMiniRect] = useState({ left: 0, top: 0, width: 0, height: 0 });
   const [showMinimap, setShowMinimap] = useState(true);
 
-  const [mouseInfo, setMouseInfo] = useState(null);   // {x, y, value, lon, lat}
+  const [mouseInfo, setMouseInfo] = useState(null);
   const mouseInfoTimeoutRef = useRef(null);
+  const fallbackDragRef = useRef({ active: false, startX: 0, startY: 0, originX: 0, originY: 0 });
+  const minimapDragRef = useRef({ active: false });
 
   const containerRef = useRef(null);
-  const imgRef = useRef(null);
-  const overviewImgRef = useRef(null);
   const abortControllerRef = useRef(null);
   const activeObjectUrlRef = useRef(null);
   const thumbnailCacheRef = useRef({});
@@ -207,111 +244,75 @@ export default function ImageViewer() {
   const viewerInteractionRef = useRef({ dragging: false, lastX: 0, lastY: 0, moved: false, suppressClick: false });
   const currentRasterSizeRef = useRef({ width: 1, height: 1 });
   const metadataCacheRef = useRef({});
-  const overviewBlobCacheRef = useRef({});
-
+  const localPreviewRef = useRef({});
+  const localFileRef = useRef({});
+  const localTiffRef = useRef({});
+  const localStretchRef = useRef({});
+  const uploadPromiseRef = useRef({});
+  const uploadFinishedRef = useRef({});
   const containerRgbRef = useRef({});
   const containerStretchRef = useRef({});
   const containerViewStateRef = useRef({});
-
   const userHasSetViewRef = useRef(false);
-const forceCleanViewerState = () => {
-  // 1. Abort any ongoing request
-  if (abortControllerRef.current) {
-    try { abortControllerRef.current.abort(); } catch (_) {}
-    abortControllerRef.current = null;
-  }
 
-  // 2. Destroy OpenSeadragon completely
-  if (viewerInteractionRef.current.cleanup) {
-    try { viewerInteractionRef.current.cleanup(); } catch (_) {}
-    viewerInteractionRef.current.cleanup = null;
-  }
-  if (viewerRef.current) {
-    try { viewerRef.current.destroy(); } catch (_) {}
-    viewerRef.current = null;
-  }
-
-  // 3. Clean object URLs
-  if (activeObjectUrlRef.current) {
-    try { URL.revokeObjectURL(activeObjectUrlRef.current); } catch (_) {}
-    activeObjectUrlRef.current = null;
-  }
-
-  // 4. Reset visual state
-  setDisplayedImageUrl("");
-  setShowOverviewInViewport(false);
-  setIsImageLoading(true);
-  setOsdReady(false);
-  osdFirstTileRef.current = false;
-  setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
-};
   const getHistoryKey = (containerName, filename) => {
     if (!containerName || !filename) return null;
     return `image:${containerName}:${filename}`;
   };
 
-  // Per-container "last RGB composite view" history. Keyed the same way
-  // as per-file history (getHistoryKey), just under a stable marker
-  // instead of a real filename, so a container's composite (which R/G/B
-  // bands are shown, its stretch, and its zoom/pan) can be saved and
-  // restored as its own unit — independent of whichever individual file
-  // was last clicked directly.
   const RGB_HISTORY_MARKER = "__rgb_composite__";
   const getRgbHistoryKey = (containerName) => getHistoryKey(containerName, RGB_HISTORY_MARKER);
+  
   const setRgbHistoryContext = (containerName) => {
     const key = getRgbHistoryKey(containerName);
     historyContextRef.current = key ? { key, containerName, baseFile: RGB_HISTORY_MARKER } : null;
     return key;
   };
+
   const getSavedRgbHistory = (containerName) => {
     const key = getRgbHistoryKey(containerName);
     return key ? imageHistoryRef.current[key] || null : null;
   };
-
   const saveCurrentImageHistory = () => {
-  const context = historyContextRef.current;
-  if (!context?.key) return;
+    const context = historyContextRef.current;
+    if (!context?.key) return;
 
-  const record = {
-    containerName: context.containerName,
-    baseFile: context.baseFile,
-    selectedFile: selectedFile || null,
-    viewMode,
-    rFile,
-    gFile,
-    bFile,
-    stretchValues: cloneStretchValues(stretchValues),
-    histDropdownFile,
-    histActiveChannel,
-    histSelectedRange: histSelectedRange ? { ...histSelectedRange } : null,
-    histSelectedChannel,
-    showHistogram,
-    scale,
-    position: { ...position },
-    displayedImageUrl,
-  };
+    const record = {
+      containerName: context.containerName,
+      baseFile: context.baseFile,
+      selectedFile: selectedFile || null,
+      viewMode,
+      rFile,
+      gFile,
+      bFile,
+      stretchValues: cloneStretchValues(stretchValues),
+      histDropdownFile,
+      histActiveChannel,
+      histSelectedRange: histSelectedRange ? { ...histSelectedRange } : null,
+      histSelectedChannel,
+      showHistogram,
+      scale,
+      position: { ...position },
+      displayedImageUrl,
+    };
 
-  // Capture the real OpenSeadragon viewport state
-  if (viewerRef.current?.viewport) {
-    try {
-      const viewport = viewerRef.current.viewport;
-      const center = viewport.getCenter();
-      const homeZoom = viewport.getHomeZoom();
-      record.osdZoom = viewport.getZoom();
-      record.osdCenter = { x: center.x, y: center.y };
-      record.osdHomeZoom = homeZoom;
-      record.scale = homeZoom > 0 ? viewport.getZoom() / homeZoom : scale;
-    } catch (error) {
-      // Viewer may be between destroy/open
+    if (viewerRef.current?.viewport) {
+      try {
+        const viewport = viewerRef.current.viewport;
+        const center = viewport.getCenter();
+        const homeZoom = viewport.getHomeZoom();
+        record.osdZoom = viewport.getZoom();
+        record.osdCenter = { x: center.x, y: center.y };
+        record.osdHomeZoom = homeZoom;
+        record.scale = homeZoom > 0 ? viewport.getZoom() / homeZoom : scale;
+      } catch (error) {}
     }
-  }
 
-  imageHistoryRef.current[context.key] = record;
-
-  if (context.containerName && context.baseFile) {
-    lastViewedFileByContainerRef.current[context.containerName] = context.baseFile;
-  }
-};
+    imageHistoryRef.current[context.key] = record;
+    if (context.containerName && context.baseFile) {
+      lastViewedFileByContainerRef.current[context.containerName] = context.baseFile;
+    }
+  };
 
   const getSavedImageHistory = (containerName, filename) => {
     const key = getHistoryKey(containerName, filename);
@@ -355,9 +356,6 @@ const forceCleanViewerState = () => {
     return cloneStretchValues(stretchStateRef.current[filename]);
   };
 
-  const MIN_SCALE = 0.05;
-  const MAX_SCALE = 50;
-
   const showToast = (message, type = "error") => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
@@ -375,54 +373,43 @@ const forceCleanViewerState = () => {
     },
     [fileDisplayNames]
   );
-// Parse virtual band key: "Container1/file.tif::band3" → {filename, band}
-const parseBandKey = (key) => {
-  if (!key) return { filename: "", band: 1 };
-  if (key.includes("::band")) {
-    const [filename, bandPart] = key.split("::band");
-    return { filename, band: parseInt(bandPart, 10) || 1 };
-  }
-  return { filename: key, band: 1 };
+
+  // Always returns a correct full storage key
+const getFullKey = (file) => {
+  if (!file) return "";
+  // Already contains container → use as-is
+  if (file.includes("/")) return file;
+  // Otherwise prefix with active container
+  return activeContainer ? `${activeContainer}/${file}` : file;
 };
 
-// Expand a multi-band file into virtual band entries
-const expandMultiBandFile = async (containerName, filePath) => {
-  try {
-    const res = await axios.get(`${API}/metadata`, { params: { filename: filePath } });
-    const bandCount = res.data.bands || 1;
-
-    if (bandCount <= 1) return; // single-band – keep as is
-
-    const bandEntries = [];
-    const newDisplayNames = {};
-
-    for (let b = 1; b <= bandCount; b++) {
-      const bandKey = `${filePath}::band${b}`;
-      bandEntries.push(bandKey);
-      newDisplayNames[bandKey] = `${getDisplayFilename(filePath)} - Band ${b}`;
+  const parseBandKey = (key) => {
+    if (!key) return { filename: "", band: 1 };
+    if (key.includes("::band")) {
+      const [filename, bandPart] = key.split("::band");
+      return { filename, band: parseInt(bandPart, 10) || 1 };
     }
-
-    setFileDisplayNames((prev) => ({ ...prev, ...newDisplayNames }));
-
-    setContainers((prev) => {
-      const files = prev[containerName] || [];
-      // Remove the original file and add the band entries
-      const filtered = files.filter((f) => f !== filePath);
-      return {
-        ...prev,
-        [containerName]: [...filtered, ...bandEntries],
-      };
-    });
-  } catch (err) {
-    console.error("Failed to expand multi-band file:", err);
-  }
-};
-  const getContainerForFile = (filename) => {
-    for (const [containerName, files] of Object.entries(containers)) {
-      if (files.includes(filename)) return containerName;
-    }
-    return null;
+    return { filename: key, band: 1 };
   };
+
+  const getContainerForFile = (filename) => {
+  if (!filename) return null;
+  // If it already has a slash, the part before / is the container
+  if (filename.includes("/")) {
+    return filename.split("/")[0];
+  }
+  for (const [containerName, files] of Object.entries(containers)) {
+    if (files.includes(filename) || files.includes(`${containerName}/${filename}`)) {
+      return containerName;
+    }
+  }
+  return null;
+};
+const expandMultiBandFile = async (containerName, filePath) => {
+  // Disabled - Do not expand multi-band files into multiple entries.
+  // Keep only the single original file that the user uploaded.
+  return;
+};
 
   const activeFilesPool = useMemo(() => {
     if (activeContainer && containers[activeContainer]) return containers[activeContainer];
@@ -432,203 +419,255 @@ const expandMultiBandFile = async (containerName, filePath) => {
   const allFilesList = useMemo(() => Object.values(containers).flat(), [containers]);
 
   const getThumbnailUrl = useCallback((filePath) => {
-    if (!thumbnailCacheRef.current[filePath]) {
-      thumbnailCacheRef.current[filePath] = `${API}/thumbnail?filename=${encodeURIComponent(filePath)}`;
-    }
-    return thumbnailCacheRef.current[filePath];
-  }, []);
-
-  // ========== IMPROVED METADATA WAIT ==========
-  // ========== 1. Stronger metadata wait ==========
-const waitForRasterMetadata = async (filename, attempts = 10, delayMs = 300) => {
-  if (metadataCacheRef.current[filename]) {
-    return metadataCacheRef.current[filename];
+  const key = getFullKey(filePath);
+  if (!thumbnailCacheRef.current[key]) {
+    thumbnailCacheRef.current[key] = `${API}/thumbnail?filename=${encodeURIComponent(key)}`;
   }
+  return thumbnailCacheRef.current[key];
+}, [activeContainer]);
 
-  let lastError = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      const res = await axios.get(`${API}/metadata`, {
-        params: { filename },
-        timeout: 3000,
-      });
-      if (res?.data?.width && res?.data?.height) {
-        metadataCacheRef.current[filename] = res.data;
-        return res.data;
+  const waitForRasterMetadata = async (filename, attempts = 8, delayMs = 250) => {
+    if (metadataCacheRef.current[filename]) return metadataCacheRef.current[filename];
+
+    let lastError = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        const res = await axios.get(`${API}/metadata`, { params: { filename }, timeout: 2500 });
+        if (res?.data?.width && res?.data?.height) {
+          metadataCacheRef.current[filename] = res.data;
+          return res.data;
+        }
+        lastError = new Error("No dimensions");
+      } catch (error) {
+        lastError = error;
       }
-      lastError = new Error("No dimensions");
-    } catch (error) {
-      lastError = error;
+      if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, delayMs));
     }
-    if (attempt < attempts - 1) {
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-  throw lastError || new Error("Metadata unavailable");
-};
+    throw lastError || new Error("Metadata unavailable");
+  };
 
- const buildOverviewUrl = (url) => {
+  const buildOverviewUrl = (url) => {
   const parsed = new URL(url);
-  if (parsed.pathname.endsWith("/rgb-composite")) {
-      const params = new URLSearchParams({
-        r_file: parsed.searchParams.get("r_file") || "",
-        g_file: parsed.searchParams.get("g_file") || "",
-        b_file: parsed.searchParams.get("b_file") || "",
-        max_size: "600",
-      });
-      ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
-        const value = parsed.searchParams.get(key);
-        if (value !== null && value !== "") params.set(key, value);
-      });
-      return `${API}/rgb-overview?${params.toString()}`;
-    }
 
-   const filename = parsed.searchParams.get("filename");
-  const band = parsed.searchParams.get("band") || "1";
-  const minVal = parsed.searchParams.get("min_val");
-  const maxVal = parsed.searchParams.get("max_val");
-  const params = new URLSearchParams({
-    filename: filename || "",
-    band: band,
-    max_size: "600",
-  });
-  if (minVal) params.set("min_val", minVal);
-  if (maxVal) params.set("max_val", maxVal);
-  return `${API}/overview?${params.toString()}`;
-};
-
-const buildFastPreviewUrl = (url) => {
-  const parsed = new URL(url);
   if (parsed.pathname.endsWith("/rgb-composite")) {
     const params = new URLSearchParams({
       r_file: parsed.searchParams.get("r_file") || "",
       g_file: parsed.searchParams.get("g_file") || "",
       b_file: parsed.searchParams.get("b_file") || "",
-      max_size: "280",
+      max_size: "480",
     });
-    ["r_min","r_max","g_min","g_max","b_min","b_max"].forEach((key) => {
+    ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
       const value = parsed.searchParams.get(key);
       if (value !== null && value !== "") params.set(key, value);
     });
     return `${API}/rgb-overview?${params.toString()}`;
   }
- const filename = parsed.searchParams.get("filename");
-  const band = parsed.searchParams.get("band") || "1";
-  if (!filename || !parsed.pathname.endsWith("/image")) return null;
-  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&band=${band}&max_size=240`;
+
+  let filename = parsed.searchParams.get("filename") || "";
+  let band = parsed.searchParams.get("band") || "1";
+
+  if (filename.includes("::band")) {
+    const p = parseBandKey(filename);
+    filename = p.filename;
+    band = String(p.band);
+  }
+
+  // Make sure we always use the full key
+  filename = getFullKey(filename);
+
+  const params = new URLSearchParams();
+  params.set("filename", filename);
+  params.set("band", band);
+  params.set("max_size", "480");
+
+  const minVal = parsed.searchParams.get("min_val");
+  const maxVal = parsed.searchParams.get("max_val");
+  if (minVal) params.set("min_val", minVal);
+  if (maxVal) params.set("max_val", maxVal);
+
+  return `${API}/overview?${params.toString()}`;
 };
 
-  // ========== IMPROVED OVERVIEW LOADER (never hangs > 10s) ==========
-  // ========== 2. Much more reliable overview loader ==========
-const loadVerifiedOverview = async (url, requestId) => {
-  const overviewUrl = buildOverviewUrl(url);
-  const fastPreviewUrl = buildFastPreviewUrl(url);
-  const deadline = Date.now() + 9000; // hard limit < 10 s
-  let lastError = null;
-  let hasPublishedOverview = false;
+const buildFastPreviewUrl = (url) => {
+  const parsed = new URL(url);
 
-  const publishObjectUrl = (objectUrl) => {
-    if (requestId !== loadSequenceRef.current) {
-      URL.revokeObjectURL(objectUrl);
-      return false;
-    }
-    if (activeObjectUrlRef.current) {
-      URL.revokeObjectURL(activeObjectUrlRef.current);
-    }
-    activeObjectUrlRef.current = objectUrl;
-    setDisplayedImageUrl(objectUrl);
-    setShowOverviewInViewport(!osdFirstTileRef.current);
-    setIsImageLoading(false);
-    hasPublishedOverview = true;
-    return true;
-  };
-
-  const tryFetchImage = async (imageUrl, timeoutMs) => {
-    // Always check cache first
-    const cachedBlob = overviewBlobCacheRef.current[imageUrl];
-    if (cachedBlob) {
-      return URL.createObjectURL(cachedBlob);
-    }
-
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetch(imageUrl, {
-        signal: controller.signal,
-        cache: "force-cache", // help browser cache
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const blob = await response.blob();
-      if (!blob || blob.size === 0) throw new Error("Empty response");
-      overviewBlobCacheRef.current[imageUrl] = blob;
-      return URL.createObjectURL(blob);
-    } finally {
-      window.clearTimeout(timeout);
-    }
-  };
-
-  // ---- Priority 1: Fast overview (critical for large files) ----
-if (fastPreviewUrl && requestId === loadSequenceRef.current) {
-  for (let i = 0; i < 5; i++) {
-    if (requestId !== loadSequenceRef.current) return false;
-    try {
-      const timeout = i === 0 ? 4500 : 3000;
-      const objectUrl = await tryFetchImage(fastPreviewUrl, timeout);
-      if (publishObjectUrl(objectUrl)) break;
-    } catch (err) {
-      lastError = err;
-      await new Promise((r) => setTimeout(r, 350));
-    }
+  if (parsed.pathname.endsWith("/rgb-composite")) {
+    const params = new URLSearchParams({
+      r_file: parsed.searchParams.get("r_file") || "",
+      g_file: parsed.searchParams.get("g_file") || "",
+      b_file: parsed.searchParams.get("b_file") || "",
+      max_size: "260",
+    });
+    ["r_min", "r_max", "g_min", "g_max", "b_min", "b_max"].forEach((key) => {
+      const value = parsed.searchParams.get(key);
+      if (value !== null && value !== "") params.set(key, value);
+    });
+    return `${API}/rgb-overview?${params.toString()}`;
   }
-}
-  // ---- Priority 2: Better overview (only if we still have time) ----
-  while (Date.now() < deadline && requestId === loadSequenceRef.current) {
-    if (hasPublishedOverview) {
-      // We already have something on screen – good enough
+
+  let filename = parsed.searchParams.get("filename") || "";
+  let band = parsed.searchParams.get("band") || "1";
+
+  if (filename.includes("::band")) {
+    const parsedBand = parseBandKey(filename);
+    filename = parsedBand.filename;
+    band = String(parsedBand.band);
+  }
+
+  if (!filename || !parsed.pathname.endsWith("/image")) return null;
+
+  // Always use full key
+  filename = getFullKey(filename);
+
+  return `${API}/fast-overview?filename=${encodeURIComponent(filename)}&band=${band}&max_size=400`;
+};
+
+  // ========== FAST OVERVIEW LOADER ==========
+  // The overview is intentionally NOT cached in JS. One Object URL is kept only
+  // while it is displayed; it is revoked when another image is opened.
+  const loadVerifiedOverview = async (url, requestId) => {
+    const overviewUrl = buildOverviewUrl(url);
+    const fastPreviewUrl = buildFastPreviewUrl(url);
+    const deadline = Date.now() + 9000;
+    let lastError = null;
+
+    const publishObjectUrl = (objectUrl) => {
+      if (requestId !== loadSequenceRef.current) {
+        URL.revokeObjectURL(objectUrl);
+        return false;
+      }
+      if (activeObjectUrlRef.current) {
+        try { URL.revokeObjectURL(activeObjectUrlRef.current); } catch (_) {}
+      }
+      activeObjectUrlRef.current = objectUrl;
+      setDisplayedImageUrl(objectUrl);
+      setShowOverviewInViewport(true);
       setIsImageLoading(false);
       return true;
+    };
+
+    const tryFetchImage = async (imageUrl, timeoutMs) => {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(`${imageUrl}${imageUrl.includes("?") ? "&" : "?"}_ts=${Date.now()}`, {
+          signal: controller.signal,
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        if (!blob || blob.size === 0) throw new Error("Empty response");
+        return URL.createObjectURL(blob);
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    };
+
+    // Priority 1: fast overview with retries (target < 10s)
+    if (fastPreviewUrl && requestId === loadSequenceRef.current) {
+      for (let i = 0; i < 4; i++) {
+        if (requestId !== loadSequenceRef.current) return false;
+        try {
+          const timeout = i === 0 ? 4000 : 2500;
+          const objectUrl = await tryFetchImage(fastPreviewUrl, timeout);
+          if (publishObjectUrl(objectUrl)) return true;
+        } catch (err) {
+          lastError = err;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
     }
 
-    const remaining = Math.max(400, deadline - Date.now());
-    try {
-      const objectUrl = await tryFetchImage(overviewUrl, Math.min(2000, remaining));
-      if (publishObjectUrl(objectUrl)) return true;
-    } catch (err) {
-      lastError = err;
+    // Priority 2: larger overview while deadline remains
+    while (Date.now() < deadline && requestId === loadSequenceRef.current) {
+      const remaining = Math.max(400, deadline - Date.now());
+      try {
+        const objectUrl = await tryFetchImage(overviewUrl, Math.min(3000, remaining));
+        if (publishObjectUrl(objectUrl)) return true;
+      } catch (err) {
+        lastError = err;
+      }
+      await new Promise((r) => setTimeout(r, 200));
     }
 
-    await new Promise((r) => setTimeout(r, 200));
-  }
-
-  // Final safety net
-  if (requestId === loadSequenceRef.current) {
-    setIsImageLoading(false);
-    if (!hasPublishedOverview) {
-      console.warn("Overview timed out:", lastError);
-      showToast("Image took too long. Click the file again.", "error");
+    if (requestId === loadSequenceRef.current) {
+      setIsImageLoading(false);
+      console.warn("Overview unavailable/slow; continuing with tiled viewer:", lastError);
+      // Do not force-hide existing local/server overview
     }
-  }
-  return hasPublishedOverview;
-};
+    return false;
+  };
 
+  const panFromMinimapPointer = (e, minimapElement) => {
+    const viewer = viewerRef.current;
+    const { width, height } = currentRasterSizeRef.current;
+    if (!viewer?.viewport || !width || !height) return;
+
+    const rect = minimapElement.getBoundingClientRect();
+    const rasterAspect = width / height;
+    const minimapAspect = rect.width / rect.height;
+    let normalizedX = (e.clientX - rect.left) / rect.width;
+    let normalizedY = (e.clientY - rect.top) / rect.height;
+
+    if (rasterAspect > minimapAspect) {
+      const displayedHeight = minimapAspect / rasterAspect;
+      normalizedY = (normalizedY - (1 - displayedHeight) / 2) / displayedHeight;
+    } else {
+      const displayedWidth = rasterAspect / minimapAspect;
+      normalizedX = (normalizedX - (1 - displayedWidth) / 2) / displayedWidth;
+    }
+
+    const imagePoint = new OpenSeadragon.Point(
+      Math.max(0, Math.min(width, normalizedX * width)),
+      Math.max(0, Math.min(height, normalizedY * height))
+    );
+    userHasSetViewRef.current = true;
+    viewer.viewport.panTo(viewer.viewport.imageToViewportCoordinates(imagePoint));
+    viewer.viewport.applyConstraints();
+  };
+
+  // Calculate the exact part of the raster currently visible in OpenSeadragon.
+  // We convert all four viewport corners separately instead of relying only on
+  // viewportToImageRectangle(), which can produce incorrect values when the
+  // viewer has margins or is constrained during pan/zoom.
   const updateMiniRectFromViewer = (width, height, viewer = viewerRef.current) => {
     if (!viewer?.viewport || !width || !height) return;
-    try {
-      const viewportBounds = viewer.viewport.getBounds(true);
-      const imageBounds = viewer.viewport.viewportToImageRectangle(viewportBounds);
 
-      const left = Math.max(0, Math.min(1, imageBounds.x / width));
-      const top = Math.max(0, Math.min(1, imageBounds.y / height));
-      const right = Math.max(left, Math.min(1, (imageBounds.x + imageBounds.width) / width));
-      const bottom = Math.max(top, Math.min(1, (imageBounds.y + imageBounds.height) / height));
+    try {
+      const bounds = viewer.viewport.getBounds(true);
+      const topLeft = viewer.viewport.viewportToImageCoordinates(
+        new OpenSeadragon.Point(bounds.x, bounds.y)
+      );
+      const topRight = viewer.viewport.viewportToImageCoordinates(
+        new OpenSeadragon.Point(bounds.x + bounds.width, bounds.y)
+      );
+      const bottomLeft = viewer.viewport.viewportToImageCoordinates(
+        new OpenSeadragon.Point(bounds.x, bounds.y + bounds.height)
+      );
+      const bottomRight = viewer.viewport.viewportToImageCoordinates(
+        new OpenSeadragon.Point(bounds.x + bounds.width, bounds.y + bounds.height)
+      );
+
+      const imageLeft = Math.min(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x);
+      const imageTop = Math.min(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y);
+      const imageRight = Math.max(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x);
+      const imageBottom = Math.max(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y);
+
+      const left = Math.max(0, Math.min(1, imageLeft / width));
+      const top = Math.max(0, Math.min(1, imageTop / height));
+      const right = Math.max(0, Math.min(1, imageRight / width));
+      const bottom = Math.max(0, Math.min(1, imageBottom / height));
 
       setMiniRect({
-        left,
-        top,
-        width: Math.max(0, Math.min(1, right - left)),
-        height: Math.max(0, Math.min(1, bottom - top)),
+        left: Math.min(left, right),
+        top: Math.min(top, bottom),
+        width: Math.max(0.005, Math.min(1, Math.abs(right - left))),
+        height: Math.max(0.005, Math.min(1, Math.abs(bottom - top))),
       });
-    } catch (error) {}
+    } catch (error) {
+      // Keep the previous rectangle if the viewer is between transitions.
+    }
   };
 
   const buildAndShowTiles = async (tileParams, requestId, restoreViewport = null) => {
@@ -637,42 +676,211 @@ if (fastPreviewUrl && requestId === loadSequenceRef.current) {
       viewerInteractionRef.current.cleanup = null;
     }
     if (viewerRef.current) {
-      viewerRef.current.destroy();
+      try { viewerRef.current.destroy(); } catch (_) {}
       viewerRef.current = null;
     }
+
+    // Reset all viewer state when switching containers/images.
+    // This prevents old minimap rectangle, zoom, and viewport state leaking.
+    setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
+    try {
+      if (osdContainerRef.current) osdContainerRef.current.innerHTML = "";
+    } catch (_) {}
+
     if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
     const metaFile = tileParams.type === "rgb" ? tileParams.r : tileParams.file;
     if (!metaFile) return;
+    const metaKey = getFullKey(metaFile);
 
-    setIsImageLoading(true);
     setOsdReady(false);
     osdFirstTileRef.current = false;
 
     try {
-      const metadata = await waitForRasterMetadata(metaFile);
-      const { width, height } = metadata;
+      // Prefer local dimensions (instant). Fall back to server metadata.
+      let width = currentRasterSizeRef.current?.width || 0;
+      let height = currentRasterSizeRef.current?.height || 0;
+      try {
+        const metadata = await waitForRasterMetadata(metaKey);
+        width = metadata.width;
+        height = metadata.height;
+        setRasterInfo(metadata);
+      } catch (metaErr) {
+        if (!width || !height) {
+          console.warn("Metadata not ready yet; waiting for upload:", metaErr?.message || metaErr);
+          // Retry a few times while background upload finishes
+          for (let i = 0; i < 8 && requestId === loadSequenceRef.current; i++) {
+            await new Promise((r) => setTimeout(r, 400));
+            try {
+              const metadata = await waitForRasterMetadata(metaKey, 2, 200);
+              width = metadata.width;
+              height = metadata.height;
+              setRasterInfo(metadata);
+              break;
+            } catch (_) {}
+          }
+        }
+      }
+      if (!width || !height) {
+        console.error("Cannot start tiles without raster dimensions");
+        return;
+      }
       currentRasterSizeRef.current = { width, height };
       if (!osdContainerRef.current || requestId !== loadSequenceRef.current) return;
 
       const maxLevel = computeMaxLevel(width, height);
 
       const buildRasterTileUrl = (level, x, y) => {
-  const { filename, band } = parseBandKey(tileParams.file);
-  let tileUrl = `${API}/tile?filename=${encodeURIComponent(filename)}&band=${band}&z=${level}&x=${x}&y=${y}`;
-  if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
-  if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
-  return tileUrl;
-};
+        const { filename, band } = parseBandKey(getFullKey(tileParams.file));
+        let tileUrl = `${API}/tile?filename=${encodeURIComponent(filename)}&band=${band}&z=${level}&x=${x}&y=${y}`;
+        if (tileParams.min !== "" && tileParams.min != null) tileUrl += `&min_val=${encodeURIComponent(tileParams.min)}`;
+        if (tileParams.max !== "" && tileParams.max != null) tileUrl += `&max_val=${encodeURIComponent(tileParams.max)}`;
+        return tileUrl;
+      };
 
       const buildRgbTileUrl = (level, x, y) => {
-        let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(tileParams.r)}&g_file=${encodeURIComponent(tileParams.g)}&b_file=${encodeURIComponent(tileParams.b)}&z=${level}&x=${x}&y=${y}`;
+        let tileUrl = `${API}/rgb-tile?r_file=${encodeURIComponent(getFullKey(tileParams.r))}&g_file=${encodeURIComponent(getFullKey(tileParams.g))}&b_file=${encodeURIComponent(getFullKey(tileParams.b))}&z=${level}&x=${x}&y=${y}`;
         [["r_min", tileParams.rMin], ["r_max", tileParams.rMax], ["g_min", tileParams.gMin], ["g_max", tileParams.gMax], ["b_min", tileParams.bMin], ["b_max", tileParams.bMax]].forEach(([key, val]) => {
           if (val !== "" && val != null) tileUrl += `&${key}=${encodeURIComponent(val)}`;
         });
         return tileUrl;
       };
 
+      // If the original File is still available in the browser and the
+      // background upload has not completed, use the local TIFF as the tile
+      // source. OpenSeadragon supports custom asynchronous tile retrieval via
+      // downloadTileStart(), so only the requested 512x512 region is decoded.
+      const localFile = tileParams.type === "raster" && !uploadFinishedRef.current[metaKey]
+        ? localFileRef.current[metaKey]
+        : null;
+      const useLocalTiles = Boolean(localFile);
+      const localTileCache = new Map();
+
+      const getLocalTiffImage = async () => {
+        if (!localFile) throw new Error("Local TIFF file is not available");
+        if (!localTiffRef.current[metaKey]) {
+          localTiffRef.current[metaKey] = (async () => {
+            const tiff = await fromBlob(localFile);
+            return await tiff.getImage();
+          })();
+        }
+        return localTiffRef.current[metaKey];
+      };
+
+      const getLocalStretch = async (image, sampleIndex) => {
+        const stretchKey = `${metaKey}:band:${sampleIndex}`;
+        if (localStretchRef.current[stretchKey]) return localStretchRef.current[stretchKey];
+
+        const promise = (async () => {
+          const nodata = typeof image.getGDALNoData === "function" ? image.getGDALNoData() : null;
+          const previewScale = Math.min(1, 768 / Math.max(width, height, 1));
+          const previewWidth = Math.max(1, Math.round(width * previewScale));
+          const previewHeight = Math.max(1, Math.round(height * previewScale));
+          const rasters = await image.readRasters({
+            samples: [sampleIndex],
+            width: previewWidth,
+            height: previewHeight,
+            interleave: false,
+            resampleMethod: "bilinear",
+          });
+          const values = rasters[0];
+          const samples = [];
+          const step = Math.max(1, Math.floor(values.length / 80000));
+          for (let i = 0; i < values.length; i += step) {
+            const value = Number(values[i]);
+            if (!Number.isFinite(value)) continue;
+            if (nodata != null && value === Number(nodata)) continue;
+            if (value === 0) continue;
+            samples.push(value);
+          }
+
+          let min = 0;
+          let max = 1;
+          if (samples.length) {
+            samples.sort((a, b) => a - b);
+            min = samples[Math.floor(samples.length * 0.02)];
+            max = samples[Math.floor(samples.length * 0.98)];
+            if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+              min = samples[0];
+              max = samples[samples.length - 1];
+            }
+          }
+          if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+            min = 0;
+            max = 1;
+          }
+          return { min, max, nodata };
+        })();
+
+        localStretchRef.current[stretchKey] = promise;
+        return promise;
+      };
+
+      const makeLocalTileCanvas = async (level, x, y) => {
+        const sampleIndex = Math.max(0, (Number(tileParams.band) || 1) - 1);
+        const cacheKey = `${metaKey}:${sampleIndex}:${tileParams.min || ""}:${tileParams.max || ""}:${level}:${x}:${y}`;
+        if (localTileCache.has(cacheKey)) return localTileCache.get(cacheKey);
+
+        const promise = (async () => {
+          const image = await getLocalTiffImage();
+          const sourceScale = Math.pow(2, maxLevel - level);
+          const levelWidth = Math.ceil(width / sourceScale);
+          const levelHeight = Math.ceil(height / sourceScale);
+          const tileWidth = Math.max(1, Math.min(TILE_SIZE, levelWidth - x * TILE_SIZE));
+          const tileHeight = Math.max(1, Math.min(TILE_SIZE, levelHeight - y * TILE_SIZE));
+          const sourceX0 = Math.max(0, Math.floor(x * TILE_SIZE * sourceScale));
+          const sourceY0 = Math.max(0, Math.floor(y * TILE_SIZE * sourceScale));
+          const sourceX1 = Math.min(width, Math.ceil((x * TILE_SIZE + tileWidth) * sourceScale));
+          const sourceY1 = Math.min(height, Math.ceil((y * TILE_SIZE + tileHeight) * sourceScale));
+          const rasters = await image.readRasters({
+            samples: [sampleIndex],
+            window: [sourceX0, sourceY0, sourceX1, sourceY1],
+            width: tileWidth,
+            height: tileHeight,
+            interleave: false,
+            resampleMethod: sourceScale > 1 ? "bilinear" : "nearest",
+          });
+          const data = rasters[0];
+
+          let min = tileParams.min !== "" && tileParams.min != null
+            ? Number(tileParams.min)
+            : NaN;
+          let max = tileParams.max !== "" && tileParams.max != null
+            ? Number(tileParams.max)
+            : NaN;
+
+          if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
+            const stretch = await getLocalStretch(image, sampleIndex);
+            min = stretch.min;
+            max = stretch.max;
+          }
+
+          const canvas = document.createElement("canvas");
+          canvas.width = tileWidth;
+          canvas.height = tileHeight;
+          const ctx = canvas.getContext("2d", { willReadFrequently: false });
+          const rgba = ctx.createImageData(tileWidth, tileHeight);
+          for (let i = 0; i < data.length; i++) {
+            const value = Number(data[i]);
+            const normalized = Number.isFinite(value)
+              ? Math.max(0, Math.min(255, ((value - min) * 255) / (max - min)))
+              : 0;
+            const j = i * 4;
+            rgba.data[j] = normalized;
+            rgba.data[j + 1] = normalized;
+            rgba.data[j + 2] = normalized;
+            rgba.data[j + 3] = 255;
+          }
+          ctx.putImageData(rgba, 0, 0);
+          return ctx;
+        })();
+
+        localTileCache.set(cacheKey, promise);
+        return promise;
+      };
+
+      // Same simple TileSource pattern as the working reference viewer:
+      // width/height known → OpenSeadragon opens immediately → tiles on demand.
       const tileSource = {
         width,
         height,
@@ -680,167 +888,107 @@ if (fastPreviewUrl && requestId === loadSequenceRef.current) {
         tileOverlap: 0,
         minLevel: 0,
         maxLevel,
-        getTileUrl: tileParams.type === "rgb" ? buildRgbTileUrl : buildRasterTileUrl,
+        getLevelScale(level) {
+          return 1 / Math.pow(2, maxLevel - level);
+        },
+        // OpenSeadragon needs the exact tile count for every pyramid level.
+        // Without this, it can keep displaying a low-resolution tile while
+        // zooming instead of requesting the native-resolution tiles.
+        getNumTiles(level) {
+          const scale = this.getLevelScale(level);
+          return new OpenSeadragon.Point(
+            Math.ceil((width * scale) / TILE_SIZE),
+            Math.ceil((height * scale) / TILE_SIZE)
+          );
+        },
+        getTileUrl(level, x, y) {
+          if (useLocalTiles) return `local-geotiff://${metaKey}/${level}/${x}/${y}`;
+          return tileParams.type === "rgb"
+            ? buildRgbTileUrl(level, x, y)
+            : buildRasterTileUrl(level, x, y);
+        },
+        getTilePostData(level, x, y) {
+          return useLocalTiles ? { level, x, y } : null;
+        },
+        getTileHashKey(level, x, y) {
+          if (useLocalTiles) return `local-geotiff:${metaKey}:${tileParams.band || 1}:${level}:${x}:${y}`;
+          return `${tileParams.type}:${metaKey}:${level}:${x}:${y}`;
+        },
+        downloadTileStart(context) {
+          if (!useLocalTiles) return OpenSeadragon.TileSource.prototype.downloadTileStart.call(this, context);
+
+          const level = context.postData?.level ?? 0;
+          const x = context.postData?.x ?? 0;
+          const y = context.postData?.y ?? 0;
+          makeLocalTileCanvas(level, x, y)
+            .then((ctx) => context.finish(ctx, null, "context2d"))
+            .catch((error) => {
+              console.warn("Local GeoTIFF tile failed:", error);
+              context.finish(null, null, error?.message || "Local tile failed");
+            });
+        },
+        downloadTileAbort() {},
       };
 
+      // Clear any leftover OSD children before re-init
+      try { osdContainerRef.current.innerHTML = ""; } catch (_) {}
+
       viewerRef.current = OpenSeadragon({
-        id: osdContainerRef.current.id,
-        prefixUrl: "",
+        element: osdContainerRef.current,
+        prefixUrl: "https://cdnjs.cloudflare.com/ajax/libs/openseadragon/4.1.0/images/",
         crossOriginPolicy: "Anonymous",
-        useCanvas: true,
+        drawer: "canvas",
+        loadTilesWithAjax: true,
         tileSources: tileSource,
         showNavigationControl: false,
+        homeFillsViewer: true,
+        visibilityRatio: 1,
+        constrainDuringPan: true,
+        minZoomImageRatio: 0.5,
+        maxZoomPixelRatio: 1,
+        zoomPerScroll: 1.2,
+        animationTime: 0.15,
+        mouseNavEnabled: true,
+        clickToZoom: false,
         gestureSettingsMouse: {
           clickToZoom: false,
           dblClickToZoom: false,
-          dragToPan: false,
-          scrollToZoom: false,
+          dragToPan: true,
+          scrollToZoom: true,
+          pinchToZoom: true,
         },
-        homeFillsViewer: false,
-        visibilityRatio: 1,
-        constrainDuringPan: true,
-        minZoomImageRatio: 1,
-        maxZoomPixelRatio: 4,
-        zoomPerScroll: 1.2,
-        animationTime: 0.8,
-        mouseNavEnabled: false,
         immediateRender: true,
-        imageLoaderLimit: 6,
-        maxImageCacheCount: 256,
-        smoothTileEdgesMinZoom: 1.0,
+        alwaysBlend: false,
+        blendTime: 0,
+        imageLoaderLimit: 8,
+        maxImageCacheCount: 80,
+        timeout: 30000,
       });
 
-      const surface = osdContainerRef.current;
-      const viewer = viewerRef.current;
-      if (surface && viewer) {
-        surface.style.cursor = "grab";
-        surface.style.touchAction = "none";
-        surface.style.userSelect = "none";
-
-        const interaction = viewerInteractionRef.current;
-        const onWheel = (event) => {
-          if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
-          event.preventDefault();
-          event.stopPropagation();
-
-          const rect = surface.getBoundingClientRect();
-          const pixel = new OpenSeadragon.Point(
-            event.clientX - rect.left,
-            event.clientY - rect.top
-          );
-          const refPoint = viewer.viewport.pointFromPixel(pixel, true);
-          const factor = event.deltaY < 0 ? 1.25 : 0.8;
-
-          viewer.viewport.zoomBy(factor, refPoint, true);
-          viewer.viewport.applyConstraints();
-          userHasSetViewRef.current = true;
-          updateMiniRectFromViewer(width, height, viewer);
-          saveCurrentImageHistory();
-        };
-
-        const onPointerDown = (event) => {
-          if (requestId !== loadSequenceRef.current || event.button !== 0 || !viewer.viewport) return;
-
-          interaction.dragging = true;
-          interaction.moved = false;
-          interaction.lastX = event.clientX;
-          interaction.lastY = event.clientY;
-          surface.style.cursor = "grabbing";
-
-          try {
-            surface.setPointerCapture(event.pointerId);
-          } catch (_) {}
-
-          event.preventDefault();
-          event.stopPropagation();
-        };
-
-        const onPointerMove = (event) => {
-          if (!interaction.dragging || requestId !== loadSequenceRef.current || !viewer.viewport) return;
-
-          const dx = event.clientX - interaction.lastX;
-          const dy = event.clientY - interaction.lastY;
-          if (Math.abs(dx) + Math.abs(dy) > 1) interaction.moved = true;
-
-          interaction.lastX = event.clientX;
-          interaction.lastY = event.clientY;
-
-          const delta = viewer.viewport.deltaPointsFromPixels(
-            new OpenSeadragon.Point(dx, dy),
-            true
-          );
-          viewer.viewport.panBy(delta.times(-1), true);
-          viewer.viewport.applyConstraints();
-          userHasSetViewRef.current = true;
-          updateMiniRectFromViewer(width, height, viewer);
-
-          event.preventDefault();
-          event.stopPropagation();
-        };
-
-        const finishPointer = (event) => {
-          if (!interaction.dragging) return;
-          interaction.dragging = false;
-          surface.style.cursor = "grab";
-          try {
-            surface.releasePointerCapture(event.pointerId);
-          } catch (_) {}
-          saveCurrentImageHistory();
-          event.preventDefault();
-          event.stopPropagation();
-        };
-
-        const onDoubleClick = (event) => {
-          if (requestId !== loadSequenceRef.current || !viewer.viewport) return;
-
-          const rect = surface.getBoundingClientRect();
-          const pixel = new OpenSeadragon.Point(
-            event.clientX - rect.left,
-            event.clientY - rect.top
-          );
-          const refPoint = viewer.viewport.pointFromPixel(pixel, true);
-
-          viewer.viewport.zoomBy(2, refPoint, true);
-          viewer.viewport.applyConstraints();
-          userHasSetViewRef.current = true;
-          updateMiniRectFromViewer(width, height, viewer);
-          saveCurrentImageHistory();
-          event.preventDefault();
-          event.stopPropagation();
-        };
-
-        surface.addEventListener("wheel", onWheel, { passive: false });
-        surface.addEventListener("pointerdown", onPointerDown);
-        surface.addEventListener("pointermove", onPointerMove);
-        surface.addEventListener("pointerup", finishPointer);
-        surface.addEventListener("pointercancel", finishPointer);
-        surface.addEventListener("dblclick", onDoubleClick);
-
-        viewerInteractionRef.current.cleanup = () => {
-          surface.removeEventListener("wheel", onWheel);
-          surface.removeEventListener("pointerdown", onPointerDown);
-          surface.removeEventListener("pointermove", onPointerMove);
-          surface.removeEventListener("pointerup", finishPointer);
-          surface.removeEventListener("pointercancel", finishPointer);
-          surface.removeEventListener("dblclick", onDoubleClick);
-          surface.style.cursor = "default";
-          surface.style.touchAction = "";
-          surface.style.userSelect = "";
-        };
-      }
+      // Let OpenSeadragon own the mouse/touch events. Do not add a React
+      // onWheel handler or a second pointer controller here: those handlers
+      // can block OSD's event pipeline and prevent tile refinement.
+      viewerInteractionRef.current.cleanup = null;
 
       viewerRef.current.addOnceHandler("open", () => {
         if (requestId !== loadSequenceRef.current) return;
+
+        // New image starts from its own bounds. Do not reuse previous container view.
+        viewerRef.current.viewport.goHome(true);
+        viewerRef.current.viewport.applyConstraints();
+        // The overview must remain visible until OpenSeadragon has actually
+        // drawn its first GeoTIFF tile. Hiding it on the `open` event can leave
+        // a black viewport because `open` may fire before the first tile.
+        setShowOverviewInViewport(true);
+        setIsImageLoading(true);
         setOsdReady(true);
         const viewer = viewerRef.current;
         if (viewer) {
           viewer.viewport.goHome(true);
           viewer.viewport.applyConstraints();
-
           const restore = restoreViewport && Number.isFinite(restoreViewport.osdZoom) && restoreViewport.osdCenter
             ? restoreViewport
             : null;
-
           requestAnimationFrame(() => {
             if (!viewerRef.current || requestId !== loadSequenceRef.current) return;
             const currentViewer = viewerRef.current;
@@ -848,10 +996,7 @@ if (fastPreviewUrl && requestId === loadSequenceRef.current) {
             currentViewer.viewport.applyConstraints();
             if (restore) {
               currentViewer.viewport.zoomTo(restore.osdZoom, null, true);
-              currentViewer.viewport.panTo(
-                new OpenSeadragon.Point(restore.osdCenter.x, restore.osdCenter.y),
-                true
-              );
+              currentViewer.viewport.panTo(new OpenSeadragon.Point(restore.osdCenter.x, restore.osdCenter.y), true);
               currentViewer.viewport.applyConstraints();
             }
             updateMiniRectFromViewer(width, height, currentViewer);
@@ -875,23 +1020,39 @@ if (fastPreviewUrl && requestId === loadSequenceRef.current) {
         saveCurrentImageHistory();
       });
 
-      viewerRef.current.addOnceHandler("tile-drawn", () => {
+      const hideOverviewOnInteraction = () => {
+        if (requestId !== loadSequenceRef.current) return;
+        if (!osdFirstTileRef.current) return;
+        setShowOverviewInViewport(false);
+      };
+
+      viewerRef.current.addHandler("canvas-press", hideOverviewOnInteraction);
+      viewerRef.current.addHandler("canvas-drag", hideOverviewOnInteraction);
+      viewerRef.current.addHandler("zoom", hideOverviewOnInteraction);
+
+      viewerRef.current.addHandler("tile-drawn", () => {
         if (requestId !== loadSequenceRef.current) return;
         osdFirstTileRef.current = true;
         setShowOverviewInViewport(false);
+        setIsImageLoading(false);
       });
 
       viewerRef.current.addHandler("resize", () => {
         const viewer = viewerRef.current;
         if (!viewer || requestId !== loadSequenceRef.current) return;
-        if (viewer.viewport.getZoom() <= viewer.viewport.getHomeZoom() * 1.01) {
-          viewer.viewport.goHome(true);
-        }
+        viewer.viewport.applyConstraints();
+        updateMiniRectFromViewer(width, height, viewer);
       });
 
-      viewerRef.current.addOnceHandler("open-failed", () => {
+      viewerRef.current.addOnceHandler("open-failed", (event) => {
         if (requestId !== loadSequenceRef.current) return;
+        console.error("OpenSeadragon open failed:", event?.message || event);
         setOsdReady(false);
+      });
+
+      viewerRef.current.addHandler("tile-load-failed", (event) => {
+        if (requestId !== loadSequenceRef.current) return;
+        console.warn("GeoTIFF tile failed:", event?.message || event);
       });
     } catch (error) {
       console.error("Failed to initialize tiled viewer:", error);
@@ -899,10 +1060,39 @@ if (fastPreviewUrl && requestId === loadSequenceRef.current) {
     }
   };
 
-  // ========== IMPROVED loadImage ==========
-const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = null) => {
-  // Clean everything first
-  forceCleanViewerState();
+  const forceCleanViewerState = (keepOverview = false) => {
+  if (abortControllerRef.current) {
+    try { abortControllerRef.current.abort(); } catch (_) {}
+    abortControllerRef.current = null;
+  }
+  if (viewerInteractionRef.current.cleanup) {
+    try { viewerInteractionRef.current.cleanup(); } catch (_) {}
+    viewerInteractionRef.current.cleanup = null;
+  }
+  if (viewerRef.current) {
+    try { viewerRef.current.clearOverlays(); } catch (_) {}
+    try { viewerRef.current.destroy(); } catch (_) {}
+    viewerRef.current = null;
+  }
+  if (!keepOverview) {
+    if (activeObjectUrlRef.current) {
+      try { URL.revokeObjectURL(activeObjectUrlRef.current); } catch (_) {}
+      activeObjectUrlRef.current = null;
+    }
+    setDisplayedImageUrl("");
+    setShowOverviewInViewport(false);
+  }
+  setIsImageLoading(!keepOverview);
+  setOsdReady(false);
+  osdFirstTileRef.current = false;
+  if (!keepOverview) {
+    setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
+  }
+};
+
+const loadImage = async (url, viewKey = null, preserveView = false, restoreViewport = null) => {
+  // keepOverview when we already show local/saved preview — user sees image immediately
+  forceCleanViewerState(Boolean(preserveView));
 
   const requestId = ++loadSequenceRef.current;
   abortControllerRef.current = new AbortController();
@@ -920,9 +1110,9 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return;
   }
 
-  // Start tiles
+  let tileParams = null;
   if (parsed.pathname.endsWith("/rgb-composite")) {
-    buildAndShowTiles({
+    tileParams = {
       type: "rgb",
       r: parsed.searchParams.get("r_file"),
       g: parsed.searchParams.get("g_file"),
@@ -933,22 +1123,26 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
       gMax: parsed.searchParams.get("g_max"),
       bMin: parsed.searchParams.get("b_min"),
       bMax: parsed.searchParams.get("b_max"),
-    }, requestId, restoreViewport);
+    };
   } else if (parsed.pathname.endsWith("/image")) {
-    buildAndShowTiles({
+    tileParams = {
       type: "raster",
       file: parsed.searchParams.get("filename"),
+      band: Number(parsed.searchParams.get("band") || 1),
       min: parsed.searchParams.get("min_val"),
       max: parsed.searchParams.get("max_val"),
-    }, requestId, restoreViewport);
+    };
   }
 
-  // Start overview
-  loadVerifiedOverview(url, requestId).then((loaded) => {
-    if (requestId === loadSequenceRef.current && !loaded) {
-      setIsImageLoading(false);
-    }
-  });
+  // SAME PATTERN AS WORKING REFERENCE APP:
+  // 1) Start tiled viewer immediately (metadata + OpenSeadragon)
+  // 2) Overview is optional and must NEVER block tiles
+  // Low-res tiles at home zoom are what make "under 10s" work for every image.
+  if (tileParams) {
+    buildAndShowTiles(tileParams, requestId, restoreViewport);
+  }
+  // Fire-and-forget overview (does not delay tiles)
+  loadVerifiedOverview(url, requestId).catch(() => {});
 };
 
   useEffect(() => {
@@ -991,11 +1185,18 @@ const loadImage = (url, viewKey = null, preserveView = false, restoreViewport = 
     return () => window.removeEventListener("resize", updateMini);
   }, [displayedImageUrl, rasterInfo?.width, rasterInfo?.height, isSwipeMode]);
 
-  const buildSingleImageUrl = (fileKey, stretch) => {
-  const { filename, band } = parseBandKey(fileKey);
+  const buildSingleImageUrl = (fileKey, stretch = {}) => {
+  const key = getFullKey(fileKey);
+  const { filename, band } = parseBandKey(key);
+
   let url = `${API}/image?filename=${encodeURIComponent(filename)}&band=${band}`;
-  if (stretch && stretch.min !== "" && stretch.min != null) url += `&min_val=${encodeURIComponent(stretch.min)}`;
-  if (stretch && stretch.max !== "" && stretch.max != null) url += `&max_val=${encodeURIComponent(stretch.max)}`;
+
+  if (stretch.min !== "" && stretch.min != null) {
+    url += `&min_val=${encodeURIComponent(stretch.min)}`;
+  }
+  if (stretch.max !== "" && stretch.max != null) {
+    url += `&max_val=${encodeURIComponent(stretch.max)}`;
+  }
   return url;
 };
 
@@ -1349,26 +1550,43 @@ useEffect(() => {
     .catch((err) => console.error("Failed to load raster info:", err));
 };
 
-  const handleFileSelectInput = (e) => {
-    const uploadedFiles = e.target.files;
-    if (!uploadedFiles || uploadedFiles.length === 0) return;
-    const inputEl = e.target;
-    const fileArray = Array.from(uploadedFiles);
+ const handleFileSelectInput = (e) => {
+  const uploadedFiles = e.target.files;
+  if (!uploadedFiles || uploadedFiles.length === 0) return;
 
-    setPendingFiles(fileArray);
-    inputEl.value = "";
+  const fileArray = Array.from(uploadedFiles);
+  e.target.value = ""; // reset input
 
-    setContainers((currentContainers) => {
-      const existingNames = Object.keys(currentContainers);
-      if (existingNames.length === 0) {
-        processUploadsToContainer("Container 1", fileArray);
-      } else {
-        setShowContainerModal(true);
-      }
-      return currentContainers;
-    });
-  };
+  setPendingFiles(fileArray);
 
+  const existingContainers = Object.keys(containers);
+
+  if (existingContainers.length === 0) {
+    // No containers yet → create first one
+    processUploadsToContainer("Container 1", fileArray);
+    return;
+  }
+
+  // Check if file with same name already exists in any container
+  const firstFileName = fileArray[0].name;
+  let matchedContainer = null;
+
+  for (const [containerName, files] of Object.entries(containers)) {
+    const exists = files.some((f) => getDisplayFilename(f) === firstFileName);
+    if (exists) {
+      matchedContainer = containerName;
+      break;
+    }
+  }
+
+  if (matchedContainer) {
+    // Same name found → automatically use that container
+    processUploadsToContainer(matchedContainer, fileArray);
+  } else {
+    // New file → ask user
+    setShowContainerModal(true);
+  }
+};
   const getNextContainerName = () => {
     const names = Object.keys(containers);
     let maxNum = 0;
@@ -1381,67 +1599,106 @@ useEffect(() => {
     });
     return `Container ${maxNum + 1}`;
   };
-
-  const processUploadsToContainer = async (targetContainerName, filesToUpload) => {
+const processUploadsToContainer = async (targetContainerName, filesToUpload) => {
   setShowContainerModal(false);
 
   for (const file of filesToUpload) {
     const storedFilePath = `${targetContainerName}/${file.name}`;
-
-    // Prevent duplicates
     if ((containers[targetContainerName] || []).includes(storedFilePath)) {
       showToast(`${file.name} already exists in ${targetContainerName}`, "error");
       continue;
     }
 
-    // Add to UI immediately
-    setContainers((prev) => {
-      const existing = prev[targetContainerName] || [];
-      if (existing.includes(storedFilePath)) return prev;
-      return {
-        ...prev,
-        [targetContainerName]: [...existing, storedFilePath],
-      };
-    });
-
-    setFileDisplayNames((prev) => ({
+    setContainers((prev) => ({
       ...prev,
-      [storedFilePath]: file.name,
+      [targetContainerName]: [...(prev[targetContainerName] || []), storedFilePath],
     }));
+    setFileDisplayNames((prev) => ({ ...prev, [storedFilePath]: file.name }));
+    setActiveContainer(targetContainerName);
+    setActiveRgbContainer(targetContainerName);
+    setSelectedFile(storedFilePath);
+    setViewMode("raster");
+    setIsImageLoading(true);
+    uploadFinishedRef.current[storedFilePath] = false;
+    // Keep the original browser File available while the background upload runs.
+    // The local tile source will read only the regions OpenSeadragon requests.
+    localFileRef.current[storedFilePath] = file;
 
+    // Start the upload immediately in the background. The preview is generated
+    // independently, so network transfer and local decoding can overlap.
+    const uploadPromise = uploadFileChunked(file, targetContainerName, (p) => setUploadProgress(p))
+      .then(async (result) => {
+        uploadFinishedRef.current[storedFilePath] = true;
+        delete localFileRef.current[storedFilePath];
+        delete localTiffRef.current[storedFilePath];
+        Object.keys(localStretchRef.current).forEach((key) => {
+          if (key.startsWith(`${storedFilePath}:`)) delete localStretchRef.current[key];
+        });
+        setActiveContainer(targetContainerName);
+        setActiveRgbContainer(targetContainerName);
+        setSelectedFile(storedFilePath);
+        setViewMode("raster");
+        await loadImage(buildSingleImageUrl(storedFilePath, { min: "", max: "" }), rasterViewKey(storedFilePath));
+        showToast(`${file.name} uploaded successfully`, "success");
+        return result;
+      })
+      .catch((error) => {
+        console.error("Background upload failed:", error);
+        showToast(`Upload failed for ${file.name}. Local preview is still available.`, "error");
+        return null;
+      })
+      .finally(() => {
+        delete uploadPromiseRef.current[storedFilePath];
+        setIsUploading(false);
+        setUploadProgress(0);
+      });
+
+    uploadPromiseRef.current[storedFilePath] = uploadPromise;
+    setIsUploading(true);
+    setUploadProgress(0);
+
+    // FIRST FOR THE USER: decode a small local preview directly from the selected
+    // file. This does not require the file to reach Codespaces and can appear
+    // while the background upload is still transferring the source TIFF.
     try {
-      setIsUploading(true);
-      setUploadProgress(0);
+      const preview = await createLocalGeoTiffPreview(file, 640);
+      if (uploadFinishedRef.current[storedFilePath]) {
+        URL.revokeObjectURL(preview.url);
+      } else {
+        // Store full object so width/height are available for tiles/OSD
+        localPreviewRef.current[storedFilePath] = preview;
+        localFileRef.current[storedFilePath] = file;
+        currentRasterSizeRef.current = { width: preview.width, height: preview.height };
+        setDisplayedImageUrl(preview.url);
+        setShowOverviewInViewport(true);
+        setRasterInfo({
+          filename: storedFilePath,
+          width: preview.width,
+          height: preview.height,
+          bands: preview.bands,
+          dtype: "local preview",
+          nodata: null,
+          crs: null,
+        });
+        setMiniRect({ left: 0, top: 0, width: 1, height: 1 });
+        setIsImageLoading(false);
 
-      await uploadFileChunked(file, targetContainerName, (percent) => {
-        setUploadProgress(percent);
-      });
-
-      setActiveContainer(targetContainerName);
-      setActiveRgbContainer(targetContainerName);
-
-      // Expand multi-band if needed
-      if (typeof expandMultiBandFile === "function") {
-        await expandMultiBandFile(targetContainerName, storedFilePath);
+        // Start OpenSeadragon against the local TIFF immediately. The upload
+        // continues independently in the background and will replace this
+        // source with backend tiles when it reaches 100%.
+        loadImage(
+          buildSingleImageUrl(storedFilePath, { min: "", max: "" }),
+          rasterViewKey(storedFilePath),
+          true
+        );
       }
-
-      showToast(`${file.name} uploaded successfully`, "success");
-
-    } catch (error) {
-      console.error("Upload failed:", error);
-      showToast(`Upload failed for ${file.name}: ${error.message}`, "error");
-
-      // Remove from sidebar if upload failed
-      setContainers((prev) => {
-        const updated = (prev[targetContainerName] || []).filter((f) => f !== storedFilePath);
-        return { ...prev, [targetContainerName]: updated };
-      });
-    } finally {
-      setIsUploading(false);
-      setUploadProgress(0);
+    } catch (previewError) {
+      console.error("Local GeoTIFF preview failed:", previewError);
+      setIsImageLoading(false);
+      showToast(`Could not preview ${file.name} locally. Upload will continue.`, "error");
     }
-  }
 
+  }
   setPendingFiles([]);
 };
 
@@ -1494,7 +1751,7 @@ useEffect(() => {
   const viewer = viewerRef.current;
   userHasSetViewRef.current = false;
 
-  if (viewer?.viewport) {
+  if (viewer?.viewport && osdReady) {
     viewer.viewport.goHome(true);          // back to 100%
     viewer.viewport.applyConstraints();
     saveCurrentImageHistory();
@@ -1507,6 +1764,11 @@ useEffect(() => {
 };
 
   const handleSelectRaster = async (filename) => {
+  console.log("handleSelectRaster called with:", filename);
+
+  setIsImageLoading(true);
+  setSelectedFile(filename);
+
   if (isSwipeMode) return;
 
   // Save current view before leaving
@@ -1520,7 +1782,6 @@ useEffect(() => {
 
   if (saved) {
     // ---------- INSTANT RESTORE ----------
-    setSelectedFile(filename);
     setViewMode(saved.viewMode || (saved.rFile && saved.gFile && saved.bFile ? "rgb" : "raster"));
     setRFile(saved.rFile || "");
     setGFile(saved.gFile || "");
@@ -1570,8 +1831,8 @@ useEffect(() => {
       if (saved.gFile) fetchChannelHistogram(saved.gFile, "g");
       if (saved.bFile) fetchChannelHistogram(saved.bFile, "b");
     }
-  } else {
-    // First time opening this file
+    } else {
+    // First time opening this file → ALWAYS show low-res original first
     setSelectedFile(filename);
     setViewMode("raster");
     setHistSelectedRange(null);
@@ -1579,7 +1840,26 @@ useEffect(() => {
     setHistDropdownFile(filename);
     setHistDefaultData(null);
     setShowHistogram(false);
-    const restoredStretch = getFileStretch(filename);
+
+    const fullKey = getFullKey(filename);
+    const localPreview = localPreviewRef.current[fullKey] || localPreviewRef.current[filename];
+    let hasLocal = false;
+
+    if (localPreview) {
+      const previewUrl = typeof localPreview === "string" ? localPreview : localPreview.url;
+      if (previewUrl) {
+        // Show low-resolution original image IMMEDIATELY
+        setDisplayedImageUrl(previewUrl);
+        setShowOverviewInViewport(true);
+        setIsImageLoading(false);
+        hasLocal = true;
+      }
+      if (localPreview.width && localPreview.height) {
+        currentRasterSizeRef.current = { width: localPreview.width, height: localPreview.height };
+      }
+    }
+
+    const restoredStretch = getFileStretch(fullKey);
     setStretchValues(restoredStretch);
     setRFile("");
     setGFile("");
@@ -1587,7 +1867,13 @@ useEffect(() => {
     setHistR(null);
     setHistG(null);
     setHistB(null);
-    loadImage(buildSingleImageUrl(filename, restoredStretch.default), rasterViewKey(filename));
+
+    // Start tiled viewer (high-res on demand) while keeping the low-res image visible
+    loadImage(
+      buildSingleImageUrl(fullKey, restoredStretch.default),
+      rasterViewKey(fullKey),
+      hasLocal          // ← keep low-res overview until first high-res tile arrives
+    );
   }
 
   if (containerName) {
@@ -1643,11 +1929,19 @@ useEffect(() => {
     delete viewStateRef.current[rasterViewKey(filename)];
     delete stretchStateRef.current[filename];
     delete metadataCacheRef.current[filename];
+    if (localPreviewRef.current[filename]) {
+      try { URL.revokeObjectURL(localPreviewRef.current[filename]); } catch (_) {}
+      delete localPreviewRef.current[filename];
+    }
+    delete localFileRef.current[filename];
+    delete localTiffRef.current[filename];
+    Object.keys(localStretchRef.current).forEach((key) => {
+      if (key.startsWith(`${filename}:`)) delete localStretchRef.current[key];
+    });
+    delete uploadPromiseRef.current[filename];
+    delete uploadFinishedRef.current[filename];
     for (const key of Object.keys(imageHistoryRef.current)) {
       if (key.endsWith(`:${filename}`)) delete imageHistoryRef.current[key];
-    }
-    for (const key of Object.keys(overviewBlobCacheRef.current)) {
-      if (key.includes(encodeURIComponent(filename))) delete overviewBlobCacheRef.current[key];
     }
 
     if (swipeLeftFile === filename) setSwipeLeftFile("");
@@ -1915,6 +2209,29 @@ const handleRGBChange = (channel, value) => {
   }, [isDraggingSwipeDivider]);
 
   useEffect(() => {
+    const handleFallbackDrag = (e) => {
+      const drag = fallbackDragRef.current;
+      if (!drag.active) return;
+      setPosition({
+        x: drag.originX + e.clientX - drag.startX,
+        y: drag.originY + e.clientY - drag.startY,
+      });
+    };
+    const finishFallbackDrag = () => {
+      if (!fallbackDragRef.current.active) return;
+      fallbackDragRef.current.active = false;
+      saveCurrentImageHistory();
+    };
+
+    window.addEventListener("pointermove", handleFallbackDrag);
+    window.addEventListener("pointerup", finishFallbackDrag);
+    return () => {
+      window.removeEventListener("pointermove", handleFallbackDrag);
+      window.removeEventListener("pointerup", finishFallbackDrag);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!histBoxDrag) return;
     const handleMove = (e) => {
       const clampedX = Math.max(0, Math.min(histBoxDrag.rectWidth, e.clientX - histBoxDrag.rectLeft));
@@ -2127,19 +2444,25 @@ const handleRGBChange = (channel, value) => {
 
   const handleZoomIn = () => {
     const viewer = viewerRef.current;
-    if (!viewer?.viewport) return;
     userHasSetViewRef.current = true;
-    viewer.viewport.zoomBy(1.25);
-    viewer.viewport.applyConstraints();
+    if (viewer?.viewport && osdReady) {
+      viewer.viewport.zoomBy(1.2, viewer.viewport.getCenter(), true);
+      viewer.viewport.applyConstraints();
+    } else {
+      setScale((currentScale) => Math.min(8, currentScale * 1.2));
+    }
     saveCurrentImageHistory();
   };
 
   const handleZoomOut = () => {
     const viewer = viewerRef.current;
-    if (!viewer?.viewport) return;
     userHasSetViewRef.current = true;
-    viewer.viewport.zoomBy(0.8);
-    viewer.viewport.applyConstraints();
+    if (viewer?.viewport && osdReady) {
+      viewer.viewport.zoomBy(1 / 1.2, viewer.viewport.getCenter(), true);
+      viewer.viewport.applyConstraints();
+    } else {
+      setScale((currentScale) => Math.max(1, currentScale / 1.2));
+    }
     saveCurrentImageHistory();
   };
 
@@ -2377,55 +2700,35 @@ const handleRGBChange = (channel, value) => {
                       cursor: "pointer",
                       userSelect: "none",
                     }}
-                    onClick={() => {
+            onClick={() => {
   saveCurrentImageHistory();
+
   setActiveContainer(containerName);
   setActiveRgbContainer(containerName);
   setHistActiveChannel(null);
-  setHistDropdownFile("");
   setShowHistogram(false);
 
   const filesInContainer = containers[containerName] || [];
   if (filesInContainer.length === 0) return;
 
-  const saved = getSavedRgbHistory(containerName);
-  setRgbHistoryContext(containerName);
+  // ========== IMPORTANT FIX ==========
+  // If the container has only 1 file → load it as a normal single image
+  if (filesInContainer.length === 1) {
+    handleSelectRaster(filesInContainer[0]);
+    return;
+  }
 
-  const savedCombo = saved && saved.rFile && saved.gFile && saved.bFile &&
-    filesInContainer.includes(saved.rFile) &&
-    filesInContainer.includes(saved.gFile) &&
-    filesInContainer.includes(saved.bFile)
-    ? saved
-    : null;
+  // If 2 or more files → create RGB composite
+  let r, g, b;
 
-  let r, g, b, stretchToUse, restoreViewport;
-
-  if (savedCombo) {
-    // Restore exactly the R/G/B bands, stretch, and zoom/pan this
-    // container's composite had the last time it was viewed — this is
-    // the fix: previously every click here reset to files[0..2] with no
-    // stretch and no zoom/pan restore, no matter what was saved.
-    r = savedCombo.rFile;
-    g = savedCombo.gFile;
-    b = savedCombo.bFile;
-    stretchToUse = cloneStretchValues(savedCombo.stretchValues);
-    restoreViewport = savedCombo;
+  if (filesInContainer.length === 2) {
+    r = filesInContainer[0];
+    g = filesInContainer[1];
+    b = filesInContainer[1];
   } else {
-    // First time viewing this container's composite — default to the
-    // first three (or fewer) files, with no stretch applied yet.
-    if (filesInContainer.length === 1) {
-      r = g = b = filesInContainer[0];
-    } else if (filesInContainer.length === 2) {
-      r = filesInContainer[0];
-      g = filesInContainer[1];
-      b = filesInContainer[1];
-    } else {
-      r = filesInContainer[0];
-      g = filesInContainer[1];
-      b = filesInContainer[2];
-    }
-    stretchToUse = createEmptyStretchValues();
-    restoreViewport = null;
+    r = filesInContainer[0];
+    g = filesInContainer[1];
+    b = filesInContainer[2];
   }
 
   setRFile(r);
@@ -2433,15 +2736,13 @@ const handleRGBChange = (channel, value) => {
   setBFile(b);
   setSelectedFile(null);
   setViewMode("rgb");
-  setStretchValues(stretchToUse);
+  setStretchValues(createEmptyStretchValues());
 
   containerRgbRef.current[containerName] = { r, g, b };
 
   loadImage(
-    buildCompositeUrl(r, g, b, stretchToUse),
-    compositeViewKey(r, g, b),
-    true,
-    restoreViewport
+    buildCompositeUrl(r, g, b, createEmptyStretchValues()),
+    `rgb:${r}:${g}:${b}`
   );
 }}
                   >
@@ -2452,42 +2753,56 @@ const handleRGBChange = (channel, value) => {
                   </div>
 
                   {files.map((filePath) => {
-                    const fileName = getDisplayFilename(filePath);
-                    const isSelected = selectedFile === filePath;
-                    return (
-                      <div
-                        key={filePath}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (isSwipeMode) return;
-                          setActiveContainer(containerName);
-                          setActiveRgbContainer(containerName);
-                          handleSelectRaster(filePath);
-                        }}
-                        style={{
-                          ...styles.rasterCard,
-                          borderColor: isSelected ? "#2563eb" : "#2a2d34",
-                          background: isSelected ? "#1e293b" : "#14171d",
-                          gridTemplateColumns: "1fr 26px",
-                        }}
-                      >
-                        <div style={styles.rasterInfoText} title={fileName}>
-                          <div style={styles.rasterName}>{fileName}</div>
-                          <div style={styles.rasterSubtext}>GeoTIFF Dataset</div>
-                        </div>
-                        <button
-                          style={styles.deleteBtn}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteRaster(e, filePath);
-                          }}
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    );
-                  })}
+  const isSelected = selectedFile === filePath;
 
+  return (
+    <div
+      key={filePath}
+      onClick={() => {
+        console.log("CLICKED:", filePath);
+
+        // Force loading state immediately
+        setIsImageLoading(true);
+        setSelectedFile(filePath);
+        setActiveContainer(containerName);
+        setActiveRgbContainer(containerName);
+
+        // Call the real function
+        handleSelectRaster(filePath);
+      }}
+      style={{
+        padding: "10px 12px",
+        marginBottom: "6px",
+        borderRadius: "6px",
+        border: isSelected ? "1px solid #3b82f6" : "1px solid #2a2d34",
+        background: isSelected ? "#1e293b" : "#14171d",
+        cursor: "pointer",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+      }}
+    >
+      <div>
+        <div style={{ fontSize: "13px", fontWeight: 600, color: "#f1f5f9" }}>
+          {getDisplayName(filePath)}
+        </div>
+        <div style={{ fontSize: "11px", color: "#64748b" }}>
+          GeoTIFF Dataset
+        </div>
+      </div>
+
+      <span
+        onClick={(e) => {
+          e.stopPropagation();
+          handleDeleteRaster(e, filePath);
+        }}
+        style={{ color: "#64748b", cursor: "pointer", padding: "4px" }}
+      >
+        ✕
+      </span>
+    </div>
+  );
+})}
                   <button
                     style={{
                       alignSelf: "flex-end",
@@ -2629,87 +2944,147 @@ const handleRGBChange = (channel, value) => {
           ) : (
             <>
               {displayedImageUrl && showOverviewInViewport && (
-                <img
-                  src={displayedImageUrl}
-                  alt="raster overview"
-                  draggable={false}
-                  onError={(e) => { e.currentTarget.style.display = "none"; }}
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    width: "100%",
-                    height: "100%",
-                    objectFit: "contain",
-                    objectPosition: "center",
-                    zIndex: 5,
-                    pointerEvents: "none",
-                    userSelect: "none",
-                  }}
-                />
-              )}
+  <img
+    src={displayedImageUrl}
+    alt="raster overview"
+    draggable={false}
+    onPointerDown={(e) => {
+      if (osdFirstTileRef.current) return;
+      e.preventDefault();
+      fallbackDragRef.current = {
+        active: true,
+        startX: e.clientX,
+        startY: e.clientY,
+        originX: position.x,
+        originY: position.y,
+      };
+      userHasSetViewRef.current = true;
+    }}
+    onError={(e) => { e.currentTarget.style.display = "none"; }}
+    style={{
+      position: "absolute",
+      inset: 0,
+      width: "100%",
+      height: "100%",
+      objectFit: "contain",
+      objectPosition: "center",
+      zIndex: 5,
+      pointerEvents: "none",
+      userSelect: "none",
+      touchAction: "none",
+      cursor: osdFirstTileRef.current ? "default" : "grab",
+      transform: `translate(${position.x}px, ${position.y}px) scale(${scale})`,
+      transformOrigin: "center center",
+    }}
+  />
+)}
               <div
                 id="osd-viewer"
                 ref={osdContainerRef}
-                style={{ position: "absolute", inset: 0, background: "#07090c", zIndex: 10 }}
+                style={{ position: "absolute", inset: 0, background: "transparent", zIndex: 20, cursor: "grab", touchAction: "none", pointerEvents: "auto" }}
               />
             </>
           )}
           {isImageLoading && !isSwipeMode && (
             <div style={styles.loadingBadge}>
-              <div style={styles.spinnerSmall} /><span>Loading image…</span>
+              <div style={styles.spinnerSmall} /><span>Loading preview…</span>
             </div>
           )}
-          {!isSwipeMode && displayedImageUrl && showMinimap && (
-            <div
-              title="Click to move viewport to this location"
-              onClick={(e) => {
-                const viewer = viewerRef.current;
-                if (!viewer?.viewport || !currentRasterSizeRef.current.width || !currentRasterSizeRef.current.height) return;
+{!isSwipeMode && displayedImageUrl && showMinimap && (
+  <div
+    title="Click to move viewport"
+    onPointerDown={(e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      minimapDragRef.current.active = true;
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      panFromMinimapPointer(e, e.currentTarget);
+    }}
+    onPointerMove={(e) => {
+      if (!minimapDragRef.current.active) return;
+      e.preventDefault();
+      panFromMinimapPointer(e, e.currentTarget);
+    }}
+    onPointerUp={(e) => {
+      minimapDragRef.current.active = false;
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+      saveCurrentImageHistory();
+    }}
+    onPointerCancel={() => { minimapDragRef.current.active = false; }}
+    style={{
+      position: "absolute",
+      right: "20px",
+      bottom: "20px",
+      width: "280px",
+      height: "200px",
+      border: "1px solid rgba(255,255,255,0.15)",
+      borderRadius: "6px",
+      overflow: "hidden",
+      background: "#0b0d11",
+      boxShadow: "0 6px 18px rgba(0,0,0,0.6)",
+      zIndex: 30,               // important – keep it above the image
+      cursor: "crosshair",
+    }}
+  >
+    <img
+      src={displayedImageUrl}
+      alt="minimap"
+      style={{
+        width: "100%",
+        height: "100%",
+        objectFit: "contain",
+        objectPosition: "center",
+        display: "block",
+        backgroundColor: "#0b0d11",
+      }}
+      draggable={false}
+    />
 
-                const box = e.currentTarget.getBoundingClientRect();
-                const clickX = e.clientX - box.left;
-                const clickY = e.clientY - box.top;
-                const rasterWidth = currentRasterSizeRef.current.width;
-                const rasterHeight = currentRasterSizeRef.current.height;
+    {/* Blue box – keep the aspect-ratio corrected version you already have */}
+    {(() => {
+      const { width: rw, height: rh } = currentRasterSizeRef.current;
+      if (!rw || !rh) return null;
 
-                const boxAspect = box.width / box.height;
-                const rasterAspect = rasterWidth / rasterHeight;
-                let renderedWidth = box.width;
-                let renderedHeight = box.height;
-                let offsetX = 0;
-                let offsetY = 0;
+      const rasterAspect = rw / rh;
+      const containerAspect = 280 / 200;
 
-                if (rasterAspect > boxAspect) {
-                  renderedHeight = box.width / rasterAspect;
-                  offsetY = (box.height - renderedHeight) / 2;
-                } else {
-                  renderedWidth = box.height * rasterAspect;
-                  offsetX = (box.width - renderedWidth) / 2;
-                }
+      let left = miniRect.left;
+      let top = miniRect.top;
+      let w = Math.max(miniRect.width, 0.01);
+      let h = Math.max(miniRect.height, 0.01);
 
-                if (
-                  clickX < offsetX ||
-                  clickX > offsetX + renderedWidth ||
-                  clickY < offsetY ||
-                  clickY > offsetY + renderedHeight
-                ) return;
+      if (rasterAspect > containerAspect) {
+        const ratio = containerAspect / rasterAspect;
+        const offset = (1 - ratio) / 2;
+        top = offset + top * ratio;
+        h = h * ratio;
+      } else {
+        const ratio = rasterAspect / containerAspect;
+        const offset = (1 - ratio) / 2;
+        left = offset + left * ratio;
+        w = w * ratio;
+      }
 
-                const imageX = ((clickX - offsetX) / renderedWidth) * rasterWidth;
-                const imageY = ((clickY - offsetY) / renderedHeight) * rasterHeight;
-
-                const target = viewer.viewport.imageToViewportCoordinates(imageX, imageY);
-                viewer.viewport.panTo(target, true);
-                viewer.viewport.applyConstraints();
-                userHasSetViewRef.current = true;
-                updateMiniRectFromViewer(rasterWidth, rasterHeight, viewer);
-                saveCurrentImageHistory();
-              }}
-              style={{ ...styles.minimapContainer, right: (showHistogram || showScatterPlot || showProfileModal) ? "378px" : "18px", cursor: "crosshair" }}
-            >
-              <img src={displayedImageUrl} alt="minimap" style={styles.minimapImage} draggable={false} />
-              <div style={{ ...styles.miniViewportRect, left: `${miniRect.left * 100}%`, top: `${miniRect.top * 100}%`, width: `${Math.max(miniRect.width * 100, 1)}%`, height: `${Math.max(miniRect.height * 100, 1)}%` }} />
-            </div>
-          )}
+      return (
+        <div
+          style={{
+            position: "absolute",
+            border: "3px solid #00e5ff",
+            boxSizing: "border-box",
+            pointerEvents: "none",
+            backgroundColor: "rgba(0,229,255,0.18)",
+            boxShadow: "0 0 0 1px rgba(0,0,0,0.85), 0 0 10px rgba(0,229,255,0.9)",
+            zIndex: 5,
+            left: `${left * 100}%`,
+            top: `${top * 100}%`,
+            width: `${Math.max(w * 100, 1.5)}%`,
+            height: `${Math.max(h * 100, 1.5)}%`,
+          }}
+        />
+      );
+    })()}
+  </div>
+)}
         </div>
       </div>
 
@@ -2822,4 +3197,154 @@ const handleRGBChange = (channel, value) => {
       {showProfileModal && (
         <div style={{ ...styles.sidePanel, right: showHistogram ? "360px" : 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-    
+            <h3 style={{ margin: 0, fontSize: "14px", color: "#f8fafc" }}>Raster Cross-Section Profile</h3>
+            <button style={{ background: "none", border: "none", color: "#94a3b8", cursor: "pointer" }} onClick={() => setShowProfileModal(false)}>✕</button>
+          </div>
+          <div style={{ display: "flex", gap: "8px", marginBottom: "16px", alignItems: "center" }}>
+            <label style={{ fontSize: "11px", color: "#94a3b8" }}>Layer/Band:</label>
+            <select value={profileFile} onChange={(e) => { const f = e.target.value; setProfileFile(f); if (profileStart && profileEnd) fetchProfilePlot(profileStart, profileEnd, f, selectedProfileBand); }} style={{ ...styles.selectInput, flex: 1 }}>
+              {activeFilesPool.map((f) => <option key={`pf-${f}`} value={f}>{getDisplayName(f)}</option>)}
+            </select>
+            {isProfileLoading && <span style={styles.inlineSpinner} />}
+          </div>
+          {isProfileLoading ? (
+            <div style={{ textAlign: "center", padding: "40px", color: "#94a3b8", fontSize: "12px" }}>Calculating profile slice...</div>
+          ) : profileData && profileData.values ? (
+            <div>
+              <div style={{ display: "flex", alignItems: "flex-end", height: "130px", gap: "2px", borderBottom: "1px solid #2a2d34", paddingBottom: "2px", marginBottom: "8px" }}>
+                {profileData.values.map((val, idx) => {
+                  const min = profileData.min;
+                  const max = profileData.max === min ? min + 1 : profileData.max;
+                  const pct = Math.max(Math.min(Math.round(((val - min) / (max - min)) * 100), 100), 2);
+                  return (
+                    <div key={idx} title={`Value: ${val.toFixed(2)}`} style={{ flex: 1, height: "100%", display: "flex", alignItems: "flex-end" }}>
+                      <div style={{ width: "100%", height: `${pct}%`, backgroundColor: "#10b981", borderRadius: "1px 1px 0 0" }} />
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "10px", color: "#64748b", marginBottom: "16px" }}>
+                <span>Start (Distance 0)</span><span>End (Distance Max)</span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "6px", fontSize: "11px", color: "#94a3b8", background: "#14171d", padding: "8px", borderRadius: "4px", border: "1px solid #1e222d" }}>
+                <div>Min: {profileData.min.toFixed(2)}</div>
+                <div>Max: {profileData.max.toFixed(2)}</div>
+              </div>
+            </div>
+          ) : (
+            <div style={{ color: "#ef4444", fontSize: "12px" }}>No profile data found</div>
+          )}
+        </div>
+      )}
+
+      {toast && (
+        <div style={{ ...styles.toast, ...(toast.type === "success" ? styles.toastSuccess : styles.toastError) }}>
+          {toast.message}
+        </div>
+      )}
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      {/* Pixel Value + Coordinates */}
+{mouseInfo && !isSwipeMode && (
+  <div style={{
+    position: "absolute",
+    left: "12px",
+    bottom: "12px",
+    background: "rgba(15, 18, 25, 0.92)",
+    border: "1px solid #1e222d",
+    borderRadius: "6px",
+    padding: "8px 12px",
+    fontSize: "12px",
+    color: "#e2e8f0",
+    zIndex: 30,
+    pointerEvents: "none",
+    minWidth: "180px",
+    lineHeight: "1.5",
+  }}>
+    <div><strong>X:</strong> {mouseInfo.x} &nbsp; <strong>Y:</strong> {mouseInfo.y}</div>
+    {mouseInfo.longitude != null && mouseInfo.latitude != null && (
+      <div>
+        <strong>Lon:</strong> {mouseInfo.longitude.toFixed(5)} &nbsp;
+        <strong>Lat:</strong> {mouseInfo.latitude.toFixed(5)}
+      </div>
+    )}
+    <div>
+      <strong>Value:</strong>{" "}
+      {mouseInfo.value != null ? mouseInfo.value.toFixed(3) : "—"}
+    </div>
+  </div>
+)}
+    </div>
+  );
+}
+
+const styles = {
+  appContainer: { display: "flex", height: "100vh", width: "100vw", backgroundColor: "#0b0d11", color: "#e2e8f0", fontFamily: "Inter, sans-serif", userSelect: "none", overflow: "hidden" },
+  sidebar: { width: "280px", borderRight: "1px solid #1e222d", padding: "16px", display: "flex", flexDirection: "column", backgroundColor: "#0f1219", flexShrink: 0 },
+  sidebarHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "20px" },
+  sidebarTitle: { margin: 0, fontSize: "18px", fontWeight: "700", color: "#f8fafc" },
+  versionBadge: { fontSize: "11px", background: "#1e293b", color: "#94a3b8", padding: "2px 6px", borderRadius: "4px" },
+  uploadBtn: { display: "flex", alignItems: "center", justifyContent: "center", background: "#2563eb", color: "#ffffff", padding: "10px", borderRadius: "6px", fontWeight: "600", fontSize: "13px", cursor: "pointer", marginBottom: "20px" },
+  uploadProgressContainer: { marginBottom: "16px" },
+  progressText: { fontSize: "11px", color: "#94a3b8", marginBottom: "4px" },
+  progressBarBg: { background: "#1e293b", height: "4px", borderRadius: "2px", overflow: "hidden" },
+  progressBarFill: { background: "#22c55e", height: "100%" },
+  sectionHeader: { fontSize: "12px", fontWeight: "600", textTransform: "uppercase", color: "#64748b", marginBottom: "12px", display: "flex", justifyContent: "space-between" },
+  badge: { background: "#1e293b", color: "#94a3b8", padding: "1px 6px", borderRadius: "10px", fontSize: "10px" },
+  rasterList: { display: "flex", flexDirection: "column", gap: "12px", overflowY: "auto", flex: 1 },
+  containerGroup: { display: "flex", flexDirection: "column", gap: "6px", border: "1px solid #1e222d", borderRadius: "6px", padding: "6px", cursor: "pointer", transition: "all 0.15s ease" },
+  containerHeaderBar: { fontSize: "11px", fontWeight: "700", color: "#38bdf8", textTransform: "uppercase", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px" },
+  emptyStateText: { fontSize: "12px", color: "#475569", textAlign: "center", marginTop: "20px", fontStyle: "italic" },
+  rasterCard: { display: "grid", gridTemplateColumns: "42px 1fr 26px", alignItems: "center", gap: "12px", padding: "10px", borderWidth: "1px", borderStyle: "solid", borderRadius: "6px", cursor: "pointer" },
+  thumbnail: { width: "42px", height: "42px", objectFit: "cover", borderRadius: "4px", border: "1px solid #2a2d34" },
+  rasterInfoText: { overflow: "hidden", minWidth: 0 },
+  rasterName: { fontSize: "13px", fontWeight: "600", color: "#f1f5f9", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  rasterSubtext: { fontSize: "11px", color: "#64748b", marginTop: "2px" },
+  deleteBtn: { background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: "14px" },
+  mainContent: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0 },
+  toolbar: { minHeight: "68px", backgroundColor: "#0f1219", borderBottom: "1px solid #1e222d", display: "flex", alignItems: "center", padding: "8px 20px", gap: "16px", overflowX: "auto" },
+  toolGroup: { display: "flex", flexDirection: "column", gap: "6px", flexShrink: 0, position: "relative" },
+  groupLabel: { fontSize: "10px", fontWeight: "600", textTransform: "uppercase", color: "#64748b" },
+  btnRow: { display: "flex", alignItems: "center", gap: "10px" },
+  iconBtn: { background: "#1e222d", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "6px 12px", borderRadius: "5px", fontSize: "12px", cursor: "pointer", display: "flex", alignItems: "center", gap: "6px", whiteSpace: "nowrap" },
+  selectInput: { background: "#14171d", color: "#f8fafc", border: "1px solid #2a2d34", padding: "5px 8px", borderRadius: "5px", fontSize: "12px", outline: "none", cursor: "pointer" },
+  selectPair: { display: "flex", alignItems: "center", gap: "4px" },
+  stretchBtn: { background: "#1e293b", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "4px 8px", borderRadius: "4px", fontSize: "10px", fontWeight: "600", cursor: "pointer", whiteSpace: "nowrap" },
+  stretchInput: { background: "#0b0d11", color: "#f8fafc", border: "1px solid #2a2d34", padding: "5px 8px", borderRadius: "5px", fontSize: "11px", outline: "none", width: "50%" },
+  inlineSpinner: { width: "12px", height: "12px", border: "2px solid #38bdf8", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 },
+  divider: { width: "1px", height: "36px", backgroundColor: "#1e222d", flexShrink: 0 },
+  metaStrip: { height: "32px", backgroundColor: "#0b0d11", borderBottom: "1px solid #1e222d", display: "flex", alignItems: "center", padding: "0 20px", gap: "20px", fontSize: "12px", color: "#94a3b8", flexShrink: 0 },
+  viewport: { flex: 1, position: "relative", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: "#07090c" },
+  rasterImageStyle: { position: "absolute", maxWidth: "none", maxHeight: "none", pointerEvents: "none", display: "block" },
+  placeholder: { color: "#475569", fontSize: "14px", fontStyle: "italic" },
+  loadingBadge: { position: "absolute", bottom: "20px", right: "20px", backgroundColor: "#0f1219", border: "1px solid #1e222d", padding: "8px 16px", borderRadius: "6px", display: "flex", alignItems: "center", gap: "10px", fontSize: "12px", color: "#f8fafc", boxShadow: "0 4px 12px rgba(0,0,0,0.5)", zIndex: 10 },
+  spinnerSmall: { width: "14px", height: "14px", border: "2px solid #38bdf8", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" },
+  toast: { position: "fixed", bottom: "24px", left: "50%", transform: "translateX(-50%)", padding: "10px 20px", borderRadius: "6px", fontSize: "13px", fontWeight: "500", zIndex: 2000, boxShadow: "0 4px 12px rgba(0,0,0,0.5)" },
+  toastSuccess: { backgroundColor: "#065f46", color: "#d1fae5", border: "1px solid #059669" },
+  toastError: { backgroundColor: "#991b1b", color: "#fee2e2", border: "1px solid #dc2626" },
+  modalBackdrop: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 3000 },
+  modalBox: { backgroundColor: "#0f1219", border: "1px solid #1e222d", borderRadius: "8px", padding: "24px", width: "360px", boxShadow: "0 8px 24px rgba(0,0,0,0.6)" },
+  sidePanel: { position: "fixed", top: 0, right: 0, bottom: 0, width: "360px", backgroundColor: "#0f1219", borderLeft: "1px solid #1e222d", boxShadow: "-8px 0 24px rgba(0,0,0,0.5)", zIndex: 900, overflowY: "auto", padding: "20px" },
+  histPanel: { position: "fixed", top: 0, right: 0, bottom: 0, width: "360px", backgroundColor: "#0f1219", borderLeft: "1px solid #1e222d", boxShadow: "-8px 0 24px rgba(0,0,0,0.5)", zIndex: 900, overflowY: "auto", padding: "20px" },
+  modalTitle: { margin: "0 0 8px 0", fontSize: "16px", fontWeight: "700", color: "#f8fafc" },
+  modalSubtitle: { margin: "0 0 16px 0", fontSize: "12px", color: "#94a3b8" },
+  modalContainerList: { display: "flex", flexDirection: "column", gap: "8px", marginBottom: "16px" },
+  modalOptionBtn: { background: "#14171d", border: "1px solid #2a2d34", color: "#e2e8f0", padding: "10px 14px", borderRadius: "6px", fontSize: "13px", fontWeight: "600", textAlign: "left", cursor: "pointer" },
+  modalCancelBtn: { background: "transparent", border: "1px solid #2a2d34", color: "#94a3b8", padding: "8px", borderRadius: "6px", fontSize: "12px", width: "100%", cursor: "pointer" },
+minimapContainer: {
+  position: "absolute",
+  right: "20px",
+  bottom: "20px",
+  width: "280px",
+  height: "200px",
+  border: "1px solid rgba(255,255,255,0.15)",
+  borderRadius: "6px",
+  overflow: "hidden",
+  background: "#0b0d11",
+  boxShadow: "0 6px 18px rgba(0,0,0,0.6)",
+  zIndex: 30,
+  cursor: "crosshair",
+},
+  minimapImage: { width: "100%", height: "100%", objectFit: "contain", objectPosition: "center", transform: "scale(1)", display: "block", backgroundColor: "#0b0d11" },
+  miniViewportRect: { position: "absolute", border: "2px solid rgba(59,130,246,0.9)", boxSizing: "border-box", pointerEvents: "none", backgroundColor: "rgba(59,130,246,0.08)" },
+};
